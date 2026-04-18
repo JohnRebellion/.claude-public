@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Pre-commit: auto-sync from ~/.claude, redact, scan, re-stage.
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+echo "[pre-commit] syncing + redacting…"
+"$REPO_ROOT/scripts/sync.sh"
+
+echo "[pre-commit] scanning for leaks…"
+"$REPO_ROOT/scripts/scan.sh" claude
+
+# Stage transformed tree
+git add claude
+
+echo "[pre-commit] ok"
