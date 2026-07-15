@@ -1,0 +1,142 @@
+{
+  "cesp_version": "1.0",
+  "name": "yennefer",
+  "display_name": "Yennefer of Vengerberg",
+  "version": "1.0.1",
+  "author": {
+    "name": "REDACTED",
+    "github": "JohnREDACTED"
+  },
+  "license": "CC-BY-NC-4.0",
+  "language": "en",
+  "categories": {
+    "session.start": {
+      "sounds": [
+        {
+          "file": "sounds/start_begin.mp3",
+          "label": "Let's do this.",
+          "sha256": "13aced0a9dcd228c80fbd20563e6ac5523ad78d98bf5956aec34e1b6a395800d"
+        },
+        {
+          "file": "sounds/start_work.mp3",
+          "label": "Time to get schwifty.",
+          "sha256": "e78aae40d7c005c5bb7669471c3f09ca8089579ee69136ff09428dbbc3f12905"
+        },
+        {
+          "file": "sounds/start_back.mp3",
+          "label": "And we're back.",
+          "sha256": "f05099bc380fb8438aaf0451b8eef89d4b98992f5923873ab65d62fc466e1582"
+        }
+      ]
+    },
+    "task.acknowledge": {
+      "sounds": [
+        {
+          "file": "sounds/ack_onit.mp3",
+          "label": "On it like a bonnet.",
+          "sha256": "9789918cfb372ee6e60ddcad453639891b1226be8aee10b747b72a22e2f33127"
+        },
+        {
+          "file": "sounds/ack_done.mp3",
+          "label": "Say no more.",
+          "sha256": "9080a75998e53cee6b2b848843659ef253da680eeb0c30c5cb58a0badf6cff99"
+        },
+        {
+          "file": "sounds/ack_leave.mp3",
+          "label": "I got you.",
+          "sha256": "8b9292846a4f0e2fbac2b01c8e3b772174f6b491e8a8d66803bd3e25d659e375"
+        }
+      ]
+    },
+    "task.complete": {
+      "sounds": [
+        {
+          "file": "sounds/done_clean.mp3",
+          "label": "Flawless victory.",
+          "sha256": "f5d3dcacd6382c994425dd05e1b2b7a21b4855a29fa103a6d295190653fc22f8"
+        },
+        {
+          "file": "sounds/done_sorted.mp3",
+          "label": "Nailed it.",
+          "sha256": "ca7dd118d54b9c26ba89c1f0b1309c9743fb333f04fe4edccfaa88b7bc56669b"
+        },
+        {
+          "file": "sounds/done_bag.mp3",
+          "label": "Too easy.",
+          "sha256": "c5c63ee8a4835367f137a707d0c22caf246d1d6592bbe36ee55458be208d610a"
+        }
+      ]
+    },
+    "task.error": {
+      "sounds": [
+        {
+          "file": "sounds/err_wrong.mp3",
+          "label": "Well, that's not great.",
+          "sha256": "2d873b5f2f5f937ced2b2277691ce9bbc4df47fd7f99d2906cb791448abbc509"
+        },
+        {
+          "file": "sounds/err_bloody.mp3",
+          "label": "Welp. My bad.",
+          "sha256": "bda0ab16bd2cb3f868b5a4dce8eb7249913ac067fc4dada448fe61b99b1cf01e"
+        },
+        {
+          "file": "sounds/err_unexpected.mp3",
+          "label": "That's... not supposed to happen.",
+          "sha256": "6733862c37216d41c6dcd9110259f51535c19d0f0c5c1c63d2a02561150b5838"
+        }
+      ]
+    },
+    "input.required": {
+      "sounds": [
+        {
+          "file": "sounds/input_need.mp3",
+          "label": "I'm gonna need a hand here.",
+          "sha256": "5a4319f9e089992d05ec690cd76878bd1aaf6a3dc7cf9b5c81cb42a4d0f56843"
+        },
+        {
+          "file": "sounds/input_call.mp3",
+          "label": "Your move.",
+          "sha256": "bb956cbd9a99f0f02b925e34e0b4cc42ab9fc97236f9951036740dc903ea98c4"
+        },
+        {
+          "file": "sounds/input_alone.mp3",
+          "label": "Little help?",
+          "sha256": "50ac03170d3ace9bac671179374ff4658be7ff97c6ab8901e9596a1afca0d17c"
+        }
+      ]
+    },
+    "resource.limit": {
+      "sounds": [
+        {
+          "file": "sounds/limit_spent.mp3",
+          "label": "I need a minute.",
+          "sha256": "7eb0737164bfc8cffb680a02aead8b642660e62a65605e16843244b9122fb8bd"
+        },
+        {
+          "file": "sounds/limit_allgot.mp3",
+          "label": "That's all I've got.",
+          "sha256": "5cb550870a88df34b37932e285a3820a0e2ef4d891602ad595e4872ec6797609"
+        }
+      ]
+    },
+    "user.spam": {
+      "sounds": [
+        {
+          "file": "sounds/spam_onething.mp3",
+          "label": "One thing at a time.",
+          "sha256": "c8f9348a7357f7367c60c14c1d61fc60c3b2fd51eb53bd21a883874e70f9ce8e"
+        },
+        {
+          "file": "sounds/spam_patience.mp3",
+          "label": "Deep breaths.",
+          "sha256": "3b1c71a2eaab42b891f86ef6e07304b57c98398d22c2d7c0533de1790c52c1f1"
+        },
+        {
+          "file": "sounds/spam_slowdown.mp3",
+          "label": "Whoa, slow your roll.",
+          "sha256": "f5916e12002833d94fb7351ba1241e114b48aae7272808ab26aed1172d7def39"
+        }
+      ]
+    }
+  }
+}

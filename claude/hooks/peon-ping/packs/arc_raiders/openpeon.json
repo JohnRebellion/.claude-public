@@ -1,0 +1,64 @@
+{
+    "cesp_version": "1.0",
+    "name": "arc-raiders",
+    "display_name": "Arc Raiders Pack",
+    "version": "1.0.0",
+    "categories": {
+        "session.start": {
+            "sounds": [
+                {
+                    "file": "sounds/TracingVictory.mp3",
+                    "label": "Tracing Victory"
+                }
+            ]
+        },
+        "task.acknowledge": {
+            "sounds": [
+                {
+                    "file": "sounds/RareLoot.mp3",
+                    "label": "Rare Loot"
+                }
+            ]
+        },
+        "task.complete": {
+            "sounds": [
+                {
+                    "file": "sounds/Blueprint.mp3",
+                    "label": "Blueprint"
+                }
+            ]
+        },
+        "task.error": {
+            "sounds": [
+                {
+                    "file": "sounds/Elevator.mp3",
+                    "label": "Elevator"
+                }
+            ]
+        },
+        "input.required": {
+            "sounds": [
+                {
+                    "file": "sounds/RaiderReady.mp3",
+                    "label": "Raider Ready"
+                }
+            ]
+        },
+        "resource.limit": {
+            "sounds": [
+                {
+                    "file": "sounds/ComingOfTime.mp3",
+                    "label": "ComingOfTime"
+                }
+            ]
+        },
+        "session.end": {
+            "sounds": [
+                {
+                    "file": "sounds/Extraction.mp3",
+                    "label": "Extraction"
+                }
+            ]
+        }
+    }
+}

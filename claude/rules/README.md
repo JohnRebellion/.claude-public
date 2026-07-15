@@ -1,3 +1,8 @@
+---
+paths:
+  - "**/.claude/rules/**"
+---
+
 # Rules
 ## Structure
 

@@ -1,4 +1,0 @@
-- [Cross-project task priorities](task_priorities.md) — active projects, top pending tasks, completion log
-- [Model routing (plan-dependent)](feedback_model_routing.md) — Haiku on Pro, full models on Team; always clarify before planning
-- [Agent and research cost limits](feedback_agent_cost_limits.md) — Pro plan: no research agents, WebSearch+WebFetch direct, reserve agents for implementation
-- [Session boundary decision](feedback_session_boundary.md) — stay vs. start-new criteria, handoff prompt format for task completion

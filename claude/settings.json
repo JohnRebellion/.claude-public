@@ -1,43 +1,36 @@
 {
   "permissions": {
     "allow": [
-      "Bash(curl -s https://api.github.com/repos/openai/openai-go)",
-      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'Name: {d[\\\\\"full_name\\\\\"]}\\\\nDescription: {d[\\\\\"description\\\\\"]}\\\\nStars: {d[\\\\\"stargazers_count\\\\\"]}\\\\nUpdated: {d[\\\\\"updated_at\\\\\"]}\\\\nTopics: {d.get\\(\\\\\"topics\\\\\", []\\)}\\\\nOrg: {d[\\\\\"owner\\\\\"][\\\\\"login\\\\\"]}\\\\nOfficial: {d[\\\\\"owner\\\\\"][\\\\\"type\\\\\"]}'\\)\")"
+      "Bash(systemctl --user show ph-deal-hunt.service -p ActiveState,SubState,Result,ExecMainStatus --no-pager)",
+      "Bash(journalctl --user -u ph-deal-hunt.service --no-pager -o cat -n 20)",
+      "Bash(timeout 210 .venv/bin/python scripts/deal_hunt_notify.py --cell 105514226150051 12 \"15x7 mags\")",
+      "Bash(echo \"exit: $?\")",
+      "Bash(systemctl --user start ph-deal-hunt.service)",
+      "Bash(chmod +x scripts/reseed_edge_copy.sh)",
+      "Bash(shellcheck scripts/reseed_edge_copy.sh)",
+      "Bash(bash -n scripts/reseed_edge_copy.sh)",
+      "Bash(journalctl --user -u ph-deal-hunt.service --no-pager -o cat -n 12)",
+      "Bash(journalctl --user -u ph-deal-hunt.service -f --no-pager -o cat --since \"now\")",
+      "Bash(journalctl --user -u ph-deal-hunt.service --no-pager -o cat --since \"20 min ago\")",
+      "Bash(cd {{ .chezmoi.homeDir }}/ph-scraper-mcp *)",
+      "Bash(git add *)",
+      "Bash(git commit -q -m 'feat\\(deal-hunt\\): twice-daily town-anchored FB hunt via personal Edge *)",
+      "Bash(journalctl --user -u ph-deal-hunt.service --no-pager -o cat --since \"today\")",
+      "Bash(systemctl --user stop ph-deal-hunt.service)",
+      "Bash(systemctl --user is-active ph-deal-hunt.service)",
+      "Bash(git fetch *)",
+      "Bash(git cherry-pick *)",
+      "Bash(echo \"exit: $? \\(1 = none found, good\\)\")",
+      "Bash(gh repo *)",
+      "Bash(python3 -)",
+      "Bash(python3 -c \"import yaml; yaml.safe_load\\(open\\('.github/workflows/deploy-frontend-amplify.yml'\\)\\); print\\('OK'\\)\")",
+      "Bash(gh auth *)"
+    ],
+    "defaultMode": "auto",
+    "additionalDirectories": [
+      "{{ .chezmoi.homeDir }}/ph-scraper-mcp/research-reports"
     ]
   },
-  "statusLine": {
-    "type": "command",
-    "command": "bash \"{{ .chezmoi.homeDir }}/.claude/plugins/cache/caveman/caveman/84cc3c14fa1e/hooks/caveman-statusline.sh\""
-  },
-  "enabledPlugins": {
-    "everything-claude-code@everything-claude-code": true,
-    "caveman@caveman": true,
-    "fullstack-dev-skills@fullstack-dev-skills": true
-  },
-  "extraKnownMarketplaces": {
-    "everything-claude-code": {
-      "source": {
-        "source": "github",
-        "repo": "affaan-m/everything-claude-code"
-      }
-    },
-    "caveman": {
-      "source": {
-        "source": "github",
-        "repo": "JuliusBrussee/caveman"
-      }
-    },
-    "fullstack-dev-skills": {
-      "source": {
-        "source": "github",
-        "repo": "jeffallan/claude-skills"
-      }
-    }
-  },
-  "spinnerTipsEnabled": true,
-  "effortLevel": "low",
-  "autoUpdatesChannel": "stable",
-  "prefersReducedMotion": false,
   "hooks": {
     "SessionStart": [
       {
@@ -47,6 +40,16 @@
             "type": "command",
             "command": "{{ .chezmoi.homeDir }}/.claude/hooks/peon-ping/peon.sh",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/dotclaude-sync/session-start.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/image-guard/sessionstart-note.sh",
+            "timeout": 5
           }
         ]
       }
@@ -127,6 +130,16 @@
             "command": "{{ .chezmoi.homeDir }}/.claude/hooks/peon-ping/peon.sh",
             "timeout": 10,
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/dotclaude-sync/stop.sh",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/session-titler/stop.sh",
+            "timeout": 15
           }
         ]
       }
@@ -168,6 +181,29 @@
             "async": true
           }
         ]
+      },
+      {
+        "matcher": "Read|NotebookRead",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/image-guard/pretooluse-guard.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Skill|Task|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/image-guard/posttooluse-skill-advisory.sh",
+            "timeout": 5,
+            "async": true
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [
@@ -196,5 +232,39 @@
         ]
       }
     ]
-  }
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bash \"{{ .chezmoi.homeDir }}/.claude/plugins/cache/caveman/caveman/84cc3c14fa1e/hooks/caveman-statusline.sh\""
+  },
+  "enabledPlugins": {
+    "everything-claude-code@everything-claude-code": true,
+    "caveman@caveman": true,
+    "fullstack-dev-skills@fullstack-dev-skills": true
+  },
+  "extraKnownMarketplaces": {
+    "everything-claude-code": {
+      "source": {
+        "source": "github",
+        "repo": "affaan-m/everything-claude-code"
+      }
+    },
+    "caveman": {
+      "source": {
+        "source": "github",
+        "repo": "JuliusBrussee/caveman"
+      }
+    },
+    "fullstack-dev-skills": {
+      "source": {
+        "source": "github",
+        "repo": "jeffallan/claude-skills"
+      }
+    }
+  },
+  "spinnerTipsEnabled": true,
+  "effortLevel": "low",
+  "autoUpdatesChannel": "stable",
+  "prefersReducedMotion": false,
+  "model": "opus[1m]"
 }

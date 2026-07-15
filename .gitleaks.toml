@@ -1,0 +1,24 @@
+# gitleaks config for .claude-public (audit 2026-07-15)
+# Public mirror of generic, reusable Claude config. Extends the default
+# ruleset; narrowly allowlists documentation EXAMPLE secrets (placeholders in
+# skill/agent markdown) that the catch-all generic-api-key heuristic flags.
+# Real provider rules (github-pat, aws, stripe, openai, …) stay ACTIVE.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "documentation placeholder secrets (not real)"
+regexes = [
+  # obvious placeholder API keys used in docs/examples
+  '''sk_live_abc123''',
+  '''sk-(xxx|example|proj-)?[A-Za-z0-9]{0,6}\b''',
+  '''(?i)your[-_]?(api[-_]?key|token|secret)[-_]?here''',
+  '''X-API-Key:\s*(sk_live_abc123|<[^>]+>|REDACTED)''',
+]
+# generic-api-key is a heuristic; scope its noise out of prose docs while
+# keeping all specific-provider rules effective across the whole tree.
+[[rules]]
+id = "generic-api-key"
+[rules.allowlist]
+description = "generic-api-key heuristic fires on doc example headers/snippets"
+paths = ['''claude/(skills|agents|commands|rules)/.*\.md$''']

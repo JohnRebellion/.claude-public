@@ -1,0 +1,86 @@
+{
+    "cesp_version": "1.0",
+    "name": "cortana_pack",
+    "display_name": "Cortana Pack",
+    "version": "1.0.3",
+    "author": {
+        "name": "Austin Andrews",
+        "github": "A3mercury"
+    },
+    "license": "CC-BY-NC-4.0",
+    "language": "en",
+    "categories": {
+        "session.start": {
+            "sounds": [
+                {
+                    "file": "sounds/MissMe.mp3",
+                    "label": "So you did miss me"
+                }
+            ]
+        },
+        "task.acknowledge": {
+            "sounds": [
+                {
+                    "file": "sounds/Answer.mp3",
+                    "label": "I think we both know the answer to that"
+                },
+                {
+                    "file": "sounds/AlreadyBegun.mp3",
+                    "label": "I've already begun"
+                },
+                {
+                    "file": "sounds/Scanning.mp3",
+                    "label": "Scanning"
+                }
+            ]
+        },
+        "task.complete": {
+            "sounds": [
+                {
+                    "file": "sounds/Ride.mp3",
+                    "label": "There's our ride. Get abord and get out of here"
+                }
+            ]
+        },
+        "task.error": {
+            "sounds": [
+                {
+                    "file": "sounds/LocatedPillar.mp3",
+                    "label": "I've located the Pillar of Autumn"
+                },
+                {
+                    "file": "sounds/ThreatLevel1.mp3",
+                    "label": "Threat level increasing"
+                },
+                {
+                    "file": "sounds/ThreatLevel2.mp3",
+                    "label": "Threat level increasing"
+                }
+            ]
+        },
+        "input.required": {
+            "sounds": [
+                {
+                    "file": "sounds/SleepWell.mp3",
+                    "label": "Sleep well?"
+                }
+            ]
+        },
+        "resource.limit": {
+            "sounds": [
+                {
+                    "file": "sounds/TakeTooLong.mp3",
+                    "label": "No, that'll take too long"
+                }
+            ]
+        },
+        "user.spam": {
+            "sounds": [
+                {
+                    "file": "sounds/WhatAreYouDoing.mp3",
+                    "label": "What the hell are you doing?"
+                }
+            ]
+        }
+    }
+}

@@ -1,15 +1,15 @@
 # Global Instructions
 
-## Intent Clarification (CRITICAL — applies to every session)
+## Intent Clarification (applies to every session)
 
-Before starting any non-trivial work, ALWAYS clarify intent first:
+Default to **acting, not asking**. Clarify only when genuinely blocked — when the request is ambiguous enough that a wrong guess wastes real work, or when an answer changes what you build.
 
-1. **Ask before planning** — When a task involves implementation, architecture, or multi-step work: ask 1-3 targeted clarifying questions to confirm scope, constraints, and expected outcome before producing a plan or writing code.
-2. **Ask before researching** — When a request is ambiguous or could go multiple directions: confirm what the user specifically wants before spending tokens.
-3. **Skip clarification for obvious tasks** — Single-file edits, direct questions, bug fixes with clear reproduction, or explicit step-by-step instructions. Just do them.
-4. **Never assume scale** — "add auth" or "set up CI" could be 5 lines or 500. Ask which.
+1. **Bias to action** — For most tasks, pick the obvious interpretation, state the assumption in one line, and proceed. Do not gate work behind a question you can answer yourself from the code, the request, or sensible defaults.
+2. **When you must ask, ask open-ended** — Never pose yes/no questions ("Should I do X?"). Ask questions that surface direction and constraints ("What should this optimize for?", "Which of these outcomes do you want?", "What's the scope here?"). One good open-ended question beats three narrow ones.
+3. **Only ask before** — destructive/irreversible ops, architectural decisions with no obvious default, or work spanning many files where a wrong scope guess is expensive. Everything else: just do it.
+4. **Never assume scale silently** — if "add auth" could be 5 lines or 500, ask which — but as an open question about scope, not a checklist.
 
-**The threshold**: if you're about to spawn an agent, enter plan mode, or touch 3+ files — clarify first.
+**The threshold**: act by default. Reserve clarification for genuine forks where your guess could be wrong *and* costly — and when you do ask, make it open-ended.
 
 ## Response Style
 

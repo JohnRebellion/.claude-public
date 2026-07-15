@@ -15,3 +15,11 @@ echo "[pre-commit] scanning for leaks…"
 git add claude
 
 echo "[pre-commit] ok"
+
+# gitleaks secret scan on the synced tree (audit 2026-07-15 R-2)
+G="$(command -v gitleaks || echo "$HOME/go/bin/gitleaks")"
+if [ -x "$G" ]; then
+  "$G" detect --source claude --config .gitleaks.toml --redact --no-banner || { echo "[gitleaks] SECRET detected — commit blocked."; exit 1; }
+else
+  echo "[gitleaks] not installed — relying on scan.sh only"
+fi
