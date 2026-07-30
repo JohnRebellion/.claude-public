@@ -58,6 +58,7 @@ print(json.dumps({
     'cwd': cwd,
     'session_id': 'kiro-' + str(sid),
     'permission_mode': data.get('permission_mode', ''),
+    'source': 'kiro',
 }))
 ")
 

@@ -44,7 +44,17 @@ else
   else
     LOGOPT=""
   fi
-  if ! timeout 60 "$GITLEAKS" detect --redact --no-banner $LOGOPT 2>/dev/null; then
+  # 600s: a large sync range (hundreds of MB of session logs) can take ~6 min
+  # to scan; 60s produced false "secret detected" blocks on timeout (exit 124).
+  timeout 600 "$GITLEAKS" detect --redact --no-banner $LOGOPT 2>/dev/null
+  RC=$?
+  if [[ "$RC" -eq 124 ]]; then
+    echo "" >&2
+    echo "[gitleaks-guard] scan TIMED OUT after 600s — push blocked (fail-closed)." >&2
+    echo "  Run the scan manually, then push with --no-verify if clean:" >&2
+    echo "  $GITLEAKS detect --redact --no-banner --log-opts=${BASE:-HEAD~20}..HEAD" >&2
+    exit 1
+  elif [[ "$RC" -ne 0 ]]; then
     echo "" >&2
     echo "[gitleaks-guard] SECRET DETECTED in commits being pushed — push blocked." >&2
     echo "  (scanned range: ${BASE:-recent}..HEAD)" >&2

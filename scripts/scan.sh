@@ -27,14 +27,33 @@ declare -A PATTERNS=(
   ["johnn"]='\bjohnn\b'
   ["mtusa"]='mtusa\.com'
   ["rebellion"]='Rebellion'
+  # Employer/client internals (audit 2026-07-15 I-3). Update as engagements change.
+  ["tyremax"]='\btyremax\b'
+  ["trackmax"]='\btrackmax\b'
+  ["wms-repos"]='\bwms-(frontend|backend)\b'
+  ["jira-tmax"]='\bTMAX-[0-9]+'
+  ["sida4"]='\bsida4\b'
+  ["4impact"]='\b4impact\b'
+  ["necir"]='necir\.ph'
   ["api-key-sk"]='\bsk-[A-Za-z0-9_-]{20,}'
   ["api-key-ghp"]='\bghp_[A-Za-z0-9]{30,}'
+  ["api-key-gho"]='\bgho_[A-Za-z0-9]{30,}'
   ["aws-key"]='\bAKIA[0-9A-Z]{16}\b'
+  ["fb-cookie"]='\b(c_user|datr)=[A-Za-z0-9]'
 )
+
+# Employer/personal-name patterns are matched case-insensitively; everything
+# else (paths, keys) stays case-sensitive so /Users/ != /users/ (API examples).
+CI_PATTERNS=" johnn rebellion tyremax trackmax wms-repos jira-tmax sida4 4impact necir "
 
 for name in "${!PATTERNS[@]}"; do
   pat="${PATTERNS[$name]}"
-  if hits=$(grep -rPnI --exclude-dir=.git "$pat" "$TARGET" 2>/dev/null); then
+  if [[ "$CI_PATTERNS" == *" $name "* ]]; then
+    flags="-rPniI"
+  else
+    flags="-rPnI"
+  fi
+  if hits=$(grep $flags --exclude-dir=.git "$pat" "$TARGET" 2>/dev/null); then
     if [[ -n "$hits" ]]; then
       report "pattern[$name]"
       echo "$hits" | head -20 >&2

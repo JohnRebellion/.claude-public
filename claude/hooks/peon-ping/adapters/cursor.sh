@@ -71,5 +71,5 @@ CWD=$(echo "$INPUT" | jq -r '.workspace_roots[0] // .cwd // ""')
 [ -z "$CWD" ] && CWD="${PWD}"
 
 echo "$INPUT" | jq --arg event "$EVENT" --arg sid "$SESSION_ID" --arg cwd "$CWD" \
-  '{hook_event_name: $event, notification_type: "", cwd: $cwd, session_id: $sid, permission_mode: ""}' \
+  '{hook_event_name: $event, notification_type: "", cwd: $cwd, session_id: $sid, permission_mode: "", source: "cursor"}' \
   | bash "$PEON_DIR/peon.sh"

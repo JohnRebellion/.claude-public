@@ -1,0 +1,33 @@
+name: leak-scan
+# CI backstop for the PUBLIC mirror (audit 2026-07-15, R-2/R-3).
+# The pre-commit hook only runs on machines with core.hooksPath set up;
+# this Action enforces the scan on every push/PR regardless.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history for gitleaks detect
+
+      - name: Run repo scan.sh (personal/employer string denylist)
+        run: |
+          chmod +x scripts/scan.sh
+          # scan the committed public tree
+          ./scripts/scan.sh claude
+
+      - name: gitleaks (secret patterns, full history)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITLEAKS_ENABLE_SUMMARY: "true"

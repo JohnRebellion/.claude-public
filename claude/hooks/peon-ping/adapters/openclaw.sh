@@ -88,8 +88,8 @@ if command -v jq &>/dev/null; then
     --arg ntype "$NTYPE" \
     --arg cwd "$PWD" \
     --arg sid "$SESSION_ID" \
-    '{hook_event_name:$hook, notification_type:$ntype, cwd:$cwd, session_id:$sid, permission_mode:""}'
+    '{hook_event_name:$hook, notification_type:$ntype, cwd:$cwd, session_id:$sid, permission_mode:"", source:"openclaw"}'
 else
-  printf '{"hook_event_name":"%s","notification_type":"%s","cwd":"%s","session_id":"%s","permission_mode":""}\n' \
+  printf '{"hook_event_name":"%s","notification_type":"%s","cwd":"%s","session_id":"%s","permission_mode":"","source":"openclaw"}\n' \
     "$EVENT" "$NTYPE" "$PWD" "$SESSION_ID"
 fi | bash "$PEON_DIR/peon.sh"

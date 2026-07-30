@@ -62,5 +62,6 @@ print(json.dumps({
     'cwd': os.environ['_PC'],
     'session_id': os.environ['_PS'],
     'permission_mode': '',
+    'source': 'windsurf',
 }))
 " | bash "$PEON_DIR/peon.sh"

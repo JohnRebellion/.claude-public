@@ -56,6 +56,7 @@ payload = {
     'cwd': '$CWD',
     'session_id': '$SESSION_ID',
     'permission_mode': '',
+    'source': 'gemini',
     'tool_name': 'Bash',
     'error': input_data.get('stderr', 'Tool failed')
 }
@@ -69,7 +70,8 @@ payload = {
     'notification_type': '',
     'cwd': '$CWD',
     'session_id': '$SESSION_ID',
-    'permission_mode': ''
+    'permission_mode': '',
+    'source': 'gemini'
 }
 print(json.dumps(payload))
 " | bash "$PEON_DIR/peon.sh" >/dev/null 2>&1 || true

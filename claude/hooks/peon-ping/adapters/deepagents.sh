@@ -58,6 +58,7 @@ print(json.dumps({
     'cwd':              os.getcwd(),
     'session_id':       'deepagents-' + str(tid),
     'permission_mode':  '',
+    'source':           'deepagents',
 }))
 ")
 

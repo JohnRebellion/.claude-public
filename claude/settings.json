@@ -38,11 +38,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/peon-ping/peon.sh",
-            "timeout": 10
-          },
-          {
-            "type": "command",
             "command": "{{ .chezmoi.homeDir }}/.claude/hooks/dotclaude-sync/session-start.sh",
             "timeout": 15
           },
@@ -50,6 +45,16 @@
             "type": "command",
             "command": "{{ .chezmoi.homeDir }}/.claude/hooks/image-guard/sessionstart-note.sh",
             "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/peon-ping/peon.sh",
+            "timeout": 10
           }
         ]
       }
@@ -127,12 +132,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/peon-ping/peon.sh",
-            "timeout": 10,
-            "async": true
-          },
-          {
-            "type": "command",
             "command": "{{ .chezmoi.homeDir }}/.claude/hooks/dotclaude-sync/stop.sh",
             "timeout": 30
           },
@@ -140,6 +139,17 @@
             "type": "command",
             "command": "{{ .chezmoi.homeDir }}/.claude/hooks/session-titler/stop.sh",
             "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/peon-ping/peon.sh",
+            "timeout": 10,
+            "async": true
           }
         ]
       }
@@ -172,6 +182,16 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "Read|NotebookRead",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/image-guard/pretooluse-guard.sh",
+            "timeout": 10
+          }
+        ]
+      },
+      {
         "matcher": "",
         "hooks": [
           {
@@ -179,16 +199,6 @@
             "command": "{{ .chezmoi.homeDir }}/.claude/hooks/peon-ping/peon.sh",
             "timeout": 10,
             "async": true
-          }
-        ]
-      },
-      {
-        "matcher": "Read|NotebookRead",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "{{ .chezmoi.homeDir }}/.claude/hooks/image-guard/pretooluse-guard.sh",
-            "timeout": 10
           }
         ]
       }
@@ -263,8 +273,8 @@
     }
   },
   "spinnerTipsEnabled": true,
-  "effortLevel": "low",
+  "effortLevel": "high",
   "autoUpdatesChannel": "stable",
   "prefersReducedMotion": false,
-  "model": "opus[1m]"
+  "tui": "fullscreen"
 }

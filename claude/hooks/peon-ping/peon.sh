@@ -113,7 +113,62 @@ detect_meeting() {
   esac
 }
 
-PEON_DIR="${CLAUDE_PEON_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# Detect if a macOS Focus / Do Not Disturb mode is active.
+# Sounds (afplay/CoreAudio) and the overlay (a custom Cocoa window) bypass
+# Notification Center entirely, so the OS Focus toggle never reaches them.
+# We read the DND daemon's assertion store to honor Focus ourselves.
+# Fails open: any unexpected format or error returns 1 so sounds keep working.
+# Returns 0 (true) if a Focus is on, 1 (false) otherwise.
+detect_focus() {
+  case "$PEON_PLATFORM" in
+    mac)
+      # Path is overridable for tests. Defaults to the live DND assertion store.
+      local _f="${PEON_DND_ASSERTIONS_FILE:-$HOME/Library/DoNotDisturb/DB/Assertions.json}"
+      [ -f "$_f" ] || return 1
+      # Focus is active iff storeAssertionRecords holds at least one assertion.
+      # (When a Focus ends, the record moves to storeInvalidationRecords and the
+      # active array becomes empty.) Fast path scans the compact JSON the daemon
+      # writes. Fall back to a tolerant parse only if the quick scan is unclear.
+      if grep -q '"storeAssertionRecords":\[[[:space:]]*{' "$_f" 2>/dev/null; then
+        return 0
+      fi
+      if grep -q '"storeAssertionRecords":\[[[:space:]]*\]' "$_f" 2>/dev/null; then
+        return 1
+      fi
+      local _on
+      _on=$(/usr/bin/python3 - "$_f" 2>/dev/null <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    if any(e.get('storeAssertionRecords') for e in d.get('data', [])):
+        print('1')
+except Exception:
+    pass
+PY
+)
+      [ "$_on" = "1" ] && return 0
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+if [ -n "${CLAUDE_PEON_DIR:-}" ]; then
+  PEON_DIR="$CLAUDE_PEON_DIR"
+else
+  _peon_script="${BASH_SOURCE[0]}"
+  while [ -L "$_peon_script" ]; do
+    _peon_link="$(readlink "$_peon_script")" || break
+    case "$_peon_link" in
+      /*) _peon_script="$_peon_link" ;;
+      *) _peon_script="$(cd "$(dirname "$_peon_script")" && pwd)/$_peon_link" ;;
+    esac
+  done
+  PEON_DIR="$(cd "$(dirname "$_peon_script")" && pwd)"
+  unset _peon_script _peon_link
+fi
 # Save original install directory for finding bundled scripts (Nix, Homebrew)
 _INSTALL_DIR="$PEON_DIR"
 # Homebrew/Nix/adapter installs: script lives in read-only store but packs/config are elsewhere.
@@ -372,6 +427,7 @@ kill_previous_sound() {
 }
 
 save_sound_pid() {
+  [ -n "${1:-}" ] || return 0
   echo "$1" > "$PEON_DIR/.sound.pid"
 }
 
@@ -497,22 +553,119 @@ play_sound() {
       fi
       ;;
     wsl)
-      local wpath
-      wpath=$(wslpath -w "$file" 2>/dev/null) || { _peon_log play "error=\"wslpath failed\" file=$(basename "$file")"; return 0; }
-      wpath="${wpath//\\/\/}"
-      powershell.exe -NoProfile -NonInteractive -Command "
-        Add-Type -AssemblyName PresentationCore
-        \$p = New-Object System.Windows.Media.MediaPlayer
-        \$p.Volume = $vol
-        \$p.Open([Uri]::new('file:///$wpath'))
-        Start-Sleep -Milliseconds 500
-        \$p.Play()
-        while (\$p.Position -lt \$p.NaturalDuration.TimeSpan -and \$p.Position.TotalSeconds -lt 10) {
-          Start-Sleep -Milliseconds 100
-        }
-        \$p.Close()
-      " &>/dev/null &
-      save_sound_pid $!
+      local backend="${PEON_WSL_AUDIO_BACKEND:-auto}"
+      case "$backend" in auto|soundplayer|mediaplayer) ;; *) backend=auto ;; esac
+
+      _wsl_mediaplayer_probe() {
+        local build cache_file probe_wav wpath result
+        build=$(powershell.exe -NoProfile -NonInteractive -Command '[System.Environment]::OSVersion.Version.Build' 2>/dev/null | tr -d '\r\n ')
+        [ -z "$build" ] && { echo no; return; }
+        cache_file="$PEON_DIR/.wsl-mediaplayer-probe-$build"
+        if [ -f "$cache_file" ]; then
+          cat "$cache_file"
+          return
+        fi
+        probe_wav=$(find "$PEON_DIR/packs" -name '*.wav' -type f 2>/dev/null | head -1)
+        [ -z "$probe_wav" ] && { echo no; return; }
+        wpath=$(wslpath -w "$probe_wav" 2>/dev/null) || { echo no; return; }
+        result=$(powershell.exe -NoProfile -NonInteractive -Command "
+          Add-Type -AssemblyName PresentationCore,WindowsBase
+          \$disp = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
+          \$p = New-Object System.Windows.Media.MediaPlayer
+          \$script:opened = \$false
+          \$p.add_MediaOpened({ \$script:opened = \$true; \$disp.InvokeShutdown() })
+          \$p.add_MediaFailed({ \$disp.InvokeShutdown() })
+          \$timer = New-Object System.Windows.Threading.DispatcherTimer
+          \$timer.Interval = [TimeSpan]::FromSeconds(2)
+          \$timer.add_Tick({ \$disp.InvokeShutdown() })
+          \$timer.Start()
+          \$p.Open([Uri]'$wpath')
+          [System.Windows.Threading.Dispatcher]::Run()
+          \$p.Close()
+          if (\$script:opened) { 'yes' } else { 'no' }
+        " 2>/dev/null | tr -d '\r\n ' | tail -c 3)
+        [ "$result" != "yes" ] && result=no
+        echo "$result" > "$cache_file" 2>/dev/null
+        _peon_log play "wsl_mediaplayer_probe build=$build result=$result"
+        echo "$result"
+      }
+
+      _wsl_play_mediaplayer() {
+        local wpath
+        wpath=$(wslpath -w "$file" 2>/dev/null) || { _peon_log play "error=\"wslpath failed\" file=$(basename "$file")"; return 1; }
+        powershell.exe -NoProfile -NonInteractive -Command "
+          Add-Type -AssemblyName PresentationCore
+          \$p = New-Object System.Windows.Media.MediaPlayer
+          \$p.Volume = $vol
+          Register-ObjectEvent -InputObject \$p -EventName MediaOpened -SourceIdentifier PeonWslOpened | Out-Null
+          Register-ObjectEvent -InputObject \$p -EventName MediaFailed -SourceIdentifier PeonWslFailed | Out-Null
+          \$p.Open([Uri]'$wpath')
+          \$p.Play()
+          # Pump the WPF dispatcher so MediaOpened fires and NaturalDuration resolves.
+          # Polling \$p.Position against NaturalDuration broke on Windows builds
+          # where the duration is not yet available right after Open (HasTimeSpan
+          # is False, so TimeSpan reads 00:00:00), which cut playback to ~0ms and
+          # left hook events silent (issue #558).
+          \$deadline = [datetime]::UtcNow.AddSeconds(5)
+          \$opened = \$false
+          while ([datetime]::UtcNow -lt \$deadline) {
+            [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke(
+              [System.Windows.Threading.DispatcherPriority]::Background, [Action]{ }
+            )
+            if (Get-Event -SourceIdentifier PeonWslFailed -ErrorAction SilentlyContinue) { break }
+            if (Get-Event -SourceIdentifier PeonWslOpened -ErrorAction SilentlyContinue) { \$opened = \$true; break }
+            Start-Sleep -Milliseconds 50
+          }
+          if (\$opened) {
+            if (\$p.NaturalDuration.HasTimeSpan) {
+              \$secs = [math]::Min(\$p.NaturalDuration.TimeSpan.TotalSeconds, 10)
+              Start-Sleep -Seconds ([math]::Ceiling(\$secs))
+            } else {
+              Start-Sleep -Seconds 3
+            }
+          }
+          Unregister-Event -SourceIdentifier PeonWslOpened -ErrorAction SilentlyContinue
+          Unregister-Event -SourceIdentifier PeonWslFailed -ErrorAction SilentlyContinue
+          \$p.Stop()
+          \$p.Close()
+        " &>/dev/null &
+        save_sound_pid $!
+      }
+
+      _wsl_play_soundplayer() {
+        local tmpdir tmpwin tmplinux
+        tmpdir=$(powershell.exe -NoProfile -NonInteractive -Command '[System.IO.Path]::GetTempPath()' 2>/dev/null | tr -d '\r')
+        [ -z "$tmpdir" ] && { _peon_log play "error=\"could not resolve windows temp dir\""; return 1; }
+        tmpwin="${tmpdir}peon-ping-sound.wav"
+        tmplinux="$(wslpath -u "$tmpwin")" || return 1
+        if command -v ffmpeg &>/dev/null; then
+          ffmpeg -y -i "$file" -filter:a "volume=$vol" "$tmplinux" 2>/dev/null || return 1
+        elif [[ "$file" == *.wav ]]; then
+          cp "$file" "$tmplinux" || return 1
+        else
+          return 1
+        fi
+        powershell.exe -NoProfile -NonInteractive -Command "
+          (New-Object System.Media.SoundPlayer '$tmpwin').PlaySync()
+        " &>/dev/null &
+        save_sound_pid $!
+      }
+
+      case "$backend" in
+        mediaplayer)
+          _wsl_play_mediaplayer
+          ;;
+        soundplayer)
+          _wsl_play_soundplayer || _peon_log play "error=\"soundplayer backend failed\" file=$(basename "$file")"
+          ;;
+        auto)
+          if [ "$(_wsl_mediaplayer_probe)" = "yes" ]; then
+            _wsl_play_mediaplayer
+          else
+            _wsl_play_soundplayer || _wsl_play_mediaplayer
+          fi
+          ;;
+      esac
       ;;
     devcontainer|ssh)
       local relay_host_default="host.docker.internal"
@@ -532,7 +685,7 @@ play_sound() {
         player=$(detect_linux_player "${LINUX_AUDIO_PLAYER:-}") || player=""
         if [ -n "$player" ]; then
           play_linux_sound "$file" "$vol" "$player"
-          save_sound_pid $!
+          [ "${PEON_TEST:-0}" = "1" ] || save_sound_pid $!
         fi
       # SSH auto mode tries relay first, then falls back to local playback.
       elif [ "$PEON_PLATFORM" = "ssh" ] && [ "$ssh_mode" = "auto" ]; then
@@ -544,7 +697,7 @@ play_sound() {
           player=$(detect_linux_player "${LINUX_AUDIO_PLAYER:-}") || player=""
           if [ -n "$player" ]; then
             play_linux_sound "$file" "$vol" "$player"
-            save_sound_pid $!
+            [ "${PEON_TEST:-0}" = "1" ] || save_sound_pid $!
           fi
         fi
       else
@@ -563,7 +716,7 @@ play_sound() {
       player=$(detect_linux_player "${LINUX_AUDIO_PLAYER:-}") || player=""
       if [ -n "$player" ]; then
         play_linux_sound "$file" "$vol" "$player"
-        save_sound_pid $!
+        [ "${PEON_TEST:-0}" = "1" ] || save_sound_pid $!
       else
         _peon_log play "error=\"no audio backend found\" searched=\"pw-play,paplay,ffplay,mpv,play,aplay\""
       fi
@@ -574,7 +727,7 @@ play_sound() {
       msys_player=$(detect_linux_player "${LINUX_AUDIO_PLAYER:-}") || msys_player=""
       if [ -n "$msys_player" ]; then
         play_linux_sound "$file" "$vol" "$msys_player"
-        save_sound_pid $!
+        [ "${PEON_TEST:-0}" = "1" ] || save_sound_pid $!
       else
         # PowerShell fallback via win-play.ps1
         local wpath win_play_script
@@ -601,7 +754,12 @@ play_sound() {
 # mac-overlay.js click handler to focus the right terminal on notification click.
 _mac_terminal_bundle_id() {
   case "${TERM_PROGRAM:-}" in
-    ghostty)        echo "com.mitchellh.ghostty" ;;
+    ghostty)
+      if _is_cmux_session; then
+        _mac_cmux_bundle_id
+      else
+        echo "com.mitchellh.ghostty"
+      fi ;;
     iTerm.app)      echo "com.googlecode.iterm2" ;;
     WarpTerminal)   echo "dev.warp.Warp-Stable" ;;
     Apple_Terminal) echo "com.apple.Terminal" ;;
@@ -618,7 +776,9 @@ _mac_terminal_bundle_id() {
       echo "" ;;
     *)
       # Fallback: detect terminal via env vars that survive tmux/screen
-      if [ -n "${GHOSTTY_RESOURCES_DIR:-}" ]; then
+      if _is_cmux_session; then
+        _mac_cmux_bundle_id
+      elif [ -n "${GHOSTTY_RESOURCES_DIR:-}" ]; then
         echo "com.mitchellh.ghostty"
       elif [ -n "${ITERM_SESSION_ID:-}" ]; then
         echo "com.googlecode.iterm2"
@@ -628,6 +788,97 @@ _mac_terminal_bundle_id() {
         echo ""
       fi ;;
   esac
+}
+
+_is_cmux_session() {
+  { [ -n "${CMUX_SURFACE_ID:-}" ] || [ -n "${CMUX_PANEL_ID:-}" ]; } && { [ -n "${CMUX_SOCKET_PATH:-}" ] || [ -n "${CMUX_SOCKET:-}" ]; }
+}
+
+_cmux_cli_path() {
+  if [ -n "${CMUX_BUNDLED_CLI_PATH:-}" ] && [ -x "${CMUX_BUNDLED_CLI_PATH:-}" ]; then
+    printf '%s\n' "$CMUX_BUNDLED_CLI_PATH"
+    return
+  fi
+  command -v cmux 2>/dev/null || true
+}
+
+_mac_cmux_bundle_id() {
+  [ -n "${PEON_CMUX_BUNDLE_ID:-}" ] && { echo "$PEON_CMUX_BUNDLE_ID"; return; }
+
+  local _name _bid
+  for _name in cmux "cmux DEV" "cmux NIGHTLY"; do
+    _bid=$(osascript -e "tell application \"System Events\" to get bundle identifier of first process whose name is \"$_name\"" 2>/dev/null) && [ -n "$_bid" ] && { echo "$_bid"; return; }
+  done
+
+  echo "com.cmuxterm.app"
+}
+
+_cmux_surface_is_current() {
+  local cmux_cli
+  cmux_cli="$(_cmux_cli_path)"
+  [ -n "$cmux_cli" ] || return 1
+  [ -n "${CMUX_SURFACE_ID:-}" ] || return 1
+
+  local identify_json
+  if [ -n "${CMUX_WORKSPACE_ID:-}" ]; then
+    identify_json=$("$cmux_cli" --json identify --workspace "$CMUX_WORKSPACE_ID" --surface "$CMUX_SURFACE_ID" 2>/dev/null || true)
+  else
+    identify_json=$("$cmux_cli" --json identify --surface "$CMUX_SURFACE_ID" 2>/dev/null || true)
+  fi
+  [ -n "$identify_json" ] || return 1
+
+  # cmux identify payloads have used both surface/panel and id/ref fields. Accept
+  # all known shapes so focus suppression does not depend on one CLI revision.
+  IDENTIFY_JSON="$identify_json" python3 - "$CMUX_SURFACE_ID" "${CMUX_WORKSPACE_ID:-}" <<'PY' >/dev/null 2>&1
+import json
+import os
+import sys
+
+expected_surface = sys.argv[1]
+expected_workspace = sys.argv[2] if len(sys.argv) > 2 else ""
+
+try:
+    payload = json.loads(os.environ.get("IDENTIFY_JSON", ""))
+except Exception:
+    sys.exit(1)
+
+focused = payload.get("focused") or {}
+caller = payload.get("caller") or {}
+if not isinstance(focused, dict):
+    sys.exit(1)
+if not isinstance(caller, dict):
+    caller = {}
+
+focused_surface = focused.get("surface_id") or focused.get("surface_ref") or focused.get("tab_id") or focused.get("tab_ref")
+caller_surface = caller.get("surface_id") or caller.get("surface_ref") or caller.get("tab_id") or caller.get("tab_ref") or expected_surface
+focused_workspace = focused.get("workspace_id") or focused.get("workspace_ref")
+caller_workspace = caller.get("workspace_id") or caller.get("workspace_ref") or expected_workspace
+
+if focused_surface and caller_surface and focused_surface == caller_surface:
+    if not caller_workspace or not focused_workspace or focused_workspace == caller_workspace:
+        sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
+# --- Update the cmux sidebar status pill for this workspace ---
+# The helper owns cmux-specific policy and CLI calls; peon.sh only forwards the
+# upstream status context it already computed.
+_cmux_update_status() {
+  local cmux_status_presentation
+  cmux_status_presentation="$(find_bundled_script "cmux-status-presentation.sh")" 2>/dev/null || return 0
+  "$cmux_status_presentation" update "${EVENT:-}" "${STATUS:-}" "${IDE_LABEL:-}" "${SESSION_ID:-}" >/dev/null 2>&1 || true
+}
+
+_cmux_update_status_async() {
+  if [ "${PEON_TEST:-0}" = "1" ]; then
+    _cmux_update_status
+  else
+    # Status mirroring is cosmetic; it should not delay sounds, notifications,
+    # or the hook process returning control to the IDE.
+    ( _cmux_update_status ) >/dev/null 2>&1 &
+  fi
 }
 
 # --- IDE ancestor PID detection (macOS click-to-focus for GUI IDEs) ---
@@ -745,6 +996,21 @@ send_notification() {
       if [ "$PEON_PLATFORM" = "mac" ]; then
         export PEON_BUNDLE_ID="$(_mac_terminal_bundle_id)"
         export PEON_IDE_PID="$(_mac_ide_pid)"
+        # Warp's per-session deep link; opening it on click focuses the exact tab.
+        export PEON_WARP_FOCUS_URL="${WARP_FOCUS_URL:-}"
+        _peon_cmux_surface="${CMUX_SURFACE_ID:-${CMUX_PANEL_ID:-}}"
+        _peon_cmux_cli="$(_cmux_cli_path)"
+        if [ -n "${CMUX_WORKSPACE_ID:-}" ] && [ -n "$_peon_cmux_surface" ] && [ -n "$_peon_cmux_cli" ]; then
+          export PEON_CMUX_WORKSPACE_ID="${CMUX_WORKSPACE_ID:-}"
+          export PEON_CMUX_SURFACE_ID="$_peon_cmux_surface"
+          export PEON_CMUX_SOCKET_PATH="${CMUX_SOCKET_PATH:-${CMUX_SOCKET:-}}"
+          export PEON_CMUX_CLI="$_peon_cmux_cli"
+        else
+          export PEON_CMUX_WORKSPACE_ID=""
+          export PEON_CMUX_SURFACE_ID=""
+          export PEON_CMUX_SOCKET_PATH=""
+          export PEON_CMUX_CLI=""
+        fi
         # Fallback: if no terminal bundle ID but we found an IDE ancestor,
         # derive the bundle ID from the IDE PID (for embedded terminals like Cursor)
         if [ -z "$PEON_BUNDLE_ID" ] && [ "${PEON_IDE_PID:-0}" != "0" ]; then
@@ -784,7 +1050,36 @@ send_notification() {
 }
 
 # --- Platform-aware terminal focus check ---
+# Returns 0 if the agent's own tmux pane is the one currently on screen
+# (active pane, active window, attached session); 1 if it's in a background
+# tmux window/pane or a detached session. No-op (returns 0) outside tmux or
+# when the state can't be determined, so callers fall through to app checks.
+_tmux_pane_is_current() {
+  [ -n "${TMUX:-}" ] || return 0
+  local pane info attached window_active pane_active
+  pane="${TMUX_PANE:-}"
+  if [ -n "$pane" ]; then
+    info=$(tmux display-message -p -t "$pane" '#{session_attached} #{window_active} #{pane_active}' 2>/dev/null || true)
+  else
+    info=$(tmux display-message -p '#{session_attached} #{window_active} #{pane_active}' 2>/dev/null || true)
+  fi
+  [ -z "$info" ] && return 0
+  attached=$(printf '%s\n' "$info" | awk '{print $1}')
+  window_active=$(printf '%s\n' "$info" | awk '{print $2}')
+  pane_active=$(printf '%s\n' "$info" | awk '{print $3}')
+  if [ "${attached:-0}" -ge 1 ] 2>/dev/null && [ "$window_active" = "1" ] && [ "$pane_active" = "1" ]; then
+    return 0
+  fi
+  return 1
+}
+
 terminal_is_focused() {
+  # tmux-aware short-circuit: if this agent's pane isn't the one on screen
+  # (background window/pane or detached session), treat as NOT focused so the
+  # notification fires regardless of which terminal app is frontmost.
+  if [ -n "${TMUX:-}" ] && ! _tmux_pane_is_current; then
+    return 1
+  fi
   case "$PEON_PLATFORM" in
     mac)
       local frontmost
@@ -817,6 +1112,13 @@ terminal_is_focused() {
           return 1  # Different tab/pane is active in all windows — notify
           ;;
         Ghostty|ghostty) _ghostty_terminal_is_current ; return $? ;;
+        cmux|cmux\ *)
+          if _is_cmux_session; then
+            _cmux_surface_is_current
+            return $?
+          fi
+          return 0
+          ;;
         Terminal|Warp|Alacritty|kitty|WezTerm) return 0 ;;
         *) return 1 ;;
       esac
@@ -832,11 +1134,23 @@ terminal_is_focused() {
     linux)
       # Only use xdotool on X11; fallback to always notify on Wayland or if xdotool is missing
       if [ "${XDG_SESSION_TYPE:-}" = "x11" ] && command -v xdotool &>/dev/null; then
-        local win_name
+        local win_name win_class win_name_lower win_class_lower
         win_name=$(xdotool getactivewindow getwindowname 2>/dev/null || echo "")
-        if [[ "$win_name" =~ (terminal|konsole|alacritty|kitty|wezterm|foot|tilix|gnome-terminal|xterm|xfce4-terminal|sakura|terminator|st|urxvt|ghostty) ]]; then
-          return 0
-        fi
+        win_class=$(xdotool getactivewindow getwindowclassname 2>/dev/null || echo "")
+        win_name_lower=$(printf '%s' "$win_name" | tr '[:upper:]' '[:lower:]')
+        win_class_lower=$(printf '%s' "$win_class" | tr '[:upper:]' '[:lower:]')
+
+        case "$win_class_lower" in
+          alacritty|kitty|org.wezfurlong.wezterm|wezterm|foot|tilix|gnome-terminal|gnome-terminal-server|xterm|xfce4-terminal|sakura|terminator|st|st-256color|urxvt|ghostty|konsole)
+            return 0
+            ;;
+        esac
+
+        case "$win_name_lower" in
+          *terminal*|*konsole*|*alacritty*|*kitty*|*wezterm*|*foot*|*tilix*|*gnome-terminal*|*xterm*|*xfce4-terminal*|*sakura*|*terminator*|*urxvt*|*ghostty*)
+            return 0
+            ;;
+        esac
       fi
       return 1
       ;;
@@ -876,6 +1190,7 @@ print('MOBILE_USER_KEY=' + q(mn.get('user_key', '')))
 print('MOBILE_APP_TOKEN=' + q(mn.get('app_token', '')))
 print('MOBILE_CHAT_ID=' + q(mn.get('chat_id', '')))
 print('MOBILE_BOT_TOKEN=' + q(mn.get('bot_token', '')))
+print('MOBILE_PRIORITY=' + q(str(mn.get('priority', '') or '')))
 " 2>/dev/null) || return 0
 
   safe_eval_python "$mobile_vars" || return 0
@@ -889,6 +1204,16 @@ print('MOBILE_BOT_TOKEN=' + q(mn.get('bot_token', '')))
     yellow) priority="default" ;;
     blue) priority="low" ;;
   esac
+
+  # An explicit priority in config overrides the color-derived default.
+  # Accepts ntfy priority names (max/urgent, high, default, low, min) or
+  # numbers 1-5. Invalid values are ignored so behavior stays predictable.
+  # Useful on iOS, where lower tiers often arrive silently.
+  if [ -n "${MOBILE_PRIORITY:-}" ]; then
+    case "$MOBILE_PRIORITY" in
+      max|urgent|5|high|4|default|3|low|2|min|1) priority="$MOBILE_PRIORITY" ;;
+    esac
+  fi
 
   # Synchronous mode for tests (avoid race with backgrounded curl)
   local use_bg=true
@@ -922,8 +1247,10 @@ print('MOBILE_BOT_TOKEN=' + q(mn.get('bot_token', '')))
       [ -z "$MOBILE_USER_KEY" ] || [ -z "$MOBILE_APP_TOKEN" ] && return 0
       local po_priority=0
       case "$priority" in
-        high) po_priority=1 ;;
-        low) po_priority=-1 ;;
+        max|urgent|5) po_priority=1 ;;
+        high|4) po_priority=1 ;;
+        low|2) po_priority=-1 ;;
+        min|1) po_priority=-2 ;;
       esac
       if [ "$use_bg" = true ]; then
         nohup curl -sf \
@@ -983,7 +1310,11 @@ src_path = os.environ.get('PEON_ENV_SYNC_SRC', '')
 dst_path = os.environ.get('PEON_ENV_SYNC_DST', '')
 
 # Keys shared between peon.sh and standalone adapters
-SHARED_KEYS = ('default_pack', 'active_pack', 'volume', 'enabled', 'desktop_notifications', 'pack_rotation', 'mobile_notify')
+SHARED_KEYS = (
+    'default_pack', 'active_pack', 'volume', 'enabled', 'desktop_notifications',
+    'pack_rotation', 'pack_rotation_mode', 'path_rules', 'exclude_dirs',
+    'ide_rules', 'mobile_notify'
+)
 
 try:
     src = json.load(open(src_path))
@@ -999,6 +1330,29 @@ changed = False
 for key in SHARED_KEYS:
     if key in src and src[key] != dst.get(key):
         dst[key] = src[key]
+        changed = True
+
+src_categories = src.get('categories')
+if isinstance(src_categories, dict):
+    dst_categories = dst.get('categories')
+    if not isinstance(dst_categories, dict):
+        dst_categories = {}
+    merged_categories = dict(dst_categories)
+    for key, value in src_categories.items():
+        if merged_categories.get(key) != value:
+            merged_categories[key] = value
+            changed = True
+    if merged_categories != dst.get('categories'):
+        dst['categories'] = merged_categories
+        changed = True
+
+threshold_map = (
+    ('annoyed_threshold', 'spam_threshold'),
+    ('annoyed_window_seconds', 'spam_window_seconds'),
+)
+for src_key, dst_key in threshold_map:
+    if src_key in src and src[src_key] != dst.get(dst_key):
+        dst[dst_key] = src[src_key]
         changed = True
 
 if changed:
@@ -1177,37 +1531,104 @@ default_display = get_display_name(default_pack)
 rotation_list = c.get('pack_rotation', []) or []
 rotation_mode = c.get('pack_rotation_mode', 'random')
 rules = c.get('path_rules', []) or []
+exclude_dirs = c.get('exclude_dirs', []) or []
+ide_rules = c.get('ide_rules', []) or []
+
+IDE_ALIASES = {
+    'claude': 'claude',
+    'claude-code': 'claude',
+    'claude_code': 'claude',
+    'claudecode': 'claude',
+    'codex': 'codex',
+    'openai-codex': 'codex',
+    'openai_codex': 'codex',
+    'cursor': 'cursor',
+    'opencode': 'opencode',
+    'open-code': 'opencode',
+    'open_code': 'opencode',
+    'kilo': 'kilo',
+    'kiro': 'kiro',
+    'gemini': 'gemini',
+    'copilot': 'copilot',
+    'windsurf': 'windsurf',
+    'kimi': 'kimi',
+    'antigravity': 'antigravity',
+    'amp': 'amp',
+    'deepagents': 'deepagents',
+    'deep-agents': 'deepagents',
+    'deep_agents': 'deepagents',
+    'openclaw': 'openclaw',
+    'open-claw': 'openclaw',
+    'open_claw': 'openclaw',
+    'rovodev': 'rovodev',
+    'rovo': 'rovodev',
+}
+
+def normalize_ide_id(value):
+    raw = str(value or '').strip().lower()
+    if not raw:
+        return ''
+    key = raw.replace(' ', '-').replace('_', '-')
+    return IDE_ALIASES.get(key, key)
+
+def normalize_path_value(value):
+    raw = str(value or '').strip()
+    if not raw:
+        return ''
+    return os.path.normpath(os.path.expanduser(raw))
+
+def path_pattern_matches(path_value, pattern):
+    path_norm = normalize_path_value(path_value)
+    pat_raw = str(pattern or '').strip()
+    if not path_norm or not pat_raw:
+        return False
+    pat = os.path.expanduser(pat_raw)
+    pat_norm = os.path.normpath(pat) if (pat.startswith('~') or '/' in pat) else pat
+    if fnmatch.fnmatch(path_norm, pat_norm):
+        return True
+    if not any(ch in pat_norm for ch in '*?['):
+        return path_norm == pat_norm or path_norm.startswith(pat_norm + os.sep)
+    return False
+
+status_ide = normalize_ide_id(
+    os.environ.get('PEON_IDE', '') or
+    os.environ.get('PEON_SESSION_SOURCE', '') or
+    os.environ.get('PEON_SOURCE', '')
+) or 'claude'
 
 # Read-only approximation of the hook's resolver — intentionally skips
 # session_packs, round-robin index mutation, and subagent inheritance
 # (those are runtime state, not answerable from cwd alone).
 def resolve_active_pack():
     cwd = os.getcwd()
+    silenced_pattern = next((pat for pat in exclude_dirs if path_pattern_matches(cwd, pat)), None)
 
-    # 1. Rotation (if active): path rule still beats rotation in hook code.
-    if rotation_list and rotation_mode in ('random', 'round-robin', 'shuffle'):
-        for r in rules:
-            pat = r.get('pattern', '')
-            pack = r.get('pack', '')
-            if cwd and pat and pack and fnmatch.fnmatch(cwd, pat):
-                return (pack, 'path rule: ' + pat + ' -> ' + pack, None, False)
-        # Rotation reason is redundant with the rotation list line shown below.
-        return (rotation_mode + ' rotation', None, None, True)
-
-    # 2. Path rules (also applies to session_override mode's fallback)
-    session_note = None
-    if rotation_mode in ('session_override', 'agentskill'):
-        session_note = 'session-override mode: per-session pack set via /peon-ping-use'
+    # 1. Path rules.
     for r in rules:
         pat = r.get('pattern', '')
         pack = r.get('pack', '')
-        if cwd and pat and pack and fnmatch.fnmatch(cwd, pat):
-            return (pack, 'path rule: ' + pat + ' -> ' + pack, session_note, False)
+        if cwd and pat and pack and path_pattern_matches(cwd, pat):
+            return (pack, 'path rule: ' + pat + ' -> ' + pack, None, False, silenced_pattern)
 
-    # 3. Default — no reason needed (it's literally the default).
-    return (default_pack, None, session_note, False)
+    # 2. IDE rules.
+    for r in ide_rules:
+        ide = normalize_ide_id(r.get('ide', ''))
+        pack = r.get('pack', '')
+        if status_ide and ide and pack and status_ide == ide:
+            return (pack, 'IDE rule: ' + ide + ' -> ' + pack, None, False, silenced_pattern)
 
-resolved_pack, reason, session_note, is_rotation = resolve_active_pack()
+    # 3. Rotation (if active).
+    if rotation_list and rotation_mode in ('random', 'round-robin', 'shuffle'):
+        # Rotation reason is redundant with the rotation list line shown below.
+        return (rotation_mode + ' rotation', None, None, True, silenced_pattern)
+
+    # 4. Default (session_override note only).
+    session_note = None
+    if rotation_mode in ('session_override', 'agentskill'):
+        session_note = 'session-override mode: per-session pack set via /peon-ping-use'
+    return (default_pack, None, session_note, False, silenced_pattern)
+
+resolved_pack, reason, session_note, is_rotation, silenced_pattern = resolve_active_pack()
 resolved_display = default_display if resolved_pack == default_pack else get_display_name(resolved_pack)
 differs_from_default = resolved_pack != default_pack
 
@@ -1265,7 +1686,12 @@ if rotation_list:
     pp('rotation list: ' + ', '.join(rotation_list))
 else:
     pp('rotation list: none')
+pp('IDE source (status): ' + status_ide)
 pp('path rules: ' + str(len(rules)) + ' configured')
+pp('silenced dirs (exclude_dirs): ' + str(len(exclude_dirs)) + ' configured')
+if silenced_pattern:
+    pp('  SILENCED here: cwd matched exclude_dirs -> ' + silenced_pattern)
+pp('IDE rules: ' + str(len(ide_rules)) + ' configured')
 pp('installed: ' + str(pack_count) + ' pack(s)')
 
 section('categories (CESP events)')
@@ -1291,6 +1717,7 @@ nd = c.get('notification_dismiss_seconds', 4)
 pp('dismiss: ' + (str(nd) + 's' if nd > 0 else 'persistent (click to dismiss)'))
 all_screens = c.get('notification_all_screens', True)
 pp('all screens: ' + ('yes' if all_screens else 'no'))
+pp('title includes IDE: ' + ('yes' if c.get('notification_title_ide', False) else 'no'))
 _lbl = c.get('notification_title_override', '')
 if _lbl:
     pp('label override: ' + _lbl)
@@ -1322,6 +1749,7 @@ if headphones_only and not headphones_detected:
     hstatus += ' (sounds muted)'
 pp('headphones: ' + hstatus)
 pp('meeting detect: ' + ('on' if c.get('meeting_detect', False) else 'off'))
+pp('focus detect: ' + (('on (suppresses: ' + str(c.get('focus_detect_mode', 'all')) + ')') if c.get('focus_detect', False) else 'off'))
 pp('suppress when tab focused: ' + ('on' if c.get('suppress_sound_when_tab_focused', False) else 'off'))
 if platform in ('ssh', 'devcontainer'):
     pp('ssh audio mode: ' + str(c.get('ssh_audio_mode', 'relay')))
@@ -1440,7 +1868,8 @@ if os.path.isdir(codex_dir):
             codex_cfg_text = open(codex_config).read()
             codex_installed = (
                 'adapters/codex.sh' in codex_cfg_text or
-                'adapters/codex.ps1' in codex_cfg_text
+                'adapters/codex.ps1' in codex_cfg_text or
+                'adapters\\\\codex.ps1' in codex_cfg_text
             )
         except Exception:
             codex_installed = False
@@ -2181,6 +2610,22 @@ import json, os, fnmatch
 config_path = os.environ.get('PEON_ENV_CONFIG', '')
 cwd = os.getcwd()
 
+def _normalize_rule_path(value):
+    if not value:
+        return ''
+    expanded = os.path.expanduser(os.path.expandvars(str(value)))
+    norm = os.path.normpath(expanded).replace('\\\\', '/')
+    return norm.rstrip('/')
+
+def path_pattern_matches(path_value, pattern):
+    if not path_value or not pattern:
+        return False
+    p = _normalize_rule_path(path_value)
+    pat = _normalize_rule_path(pattern)
+    if any(ch in pat for ch in ['*', '?', '[']):
+        return fnmatch.fnmatch(p, pat)
+    return p == pat or p.startswith(pat + '/')
+
 try:
     cfg = json.load(open(config_path))
 except Exception:
@@ -2193,10 +2638,273 @@ else:
     for rule in path_rules:
         pattern = rule.get('pattern', '')
         pack = rule.get('pack', '')
-        marker = ' *' if fnmatch.fnmatch(cwd, pattern) else ''
+        marker = ' *' if path_pattern_matches(cwd, pattern) else ''
         print(f'  {pattern} -> {pack}{marker}')
 "
         exit 0 ;;
+      ide-bind)
+        IDE_ARG=""
+        PACK_ARG=""
+        IDE_INSTALL=0
+        for arg in "${@:3}"; do
+          case "$arg" in
+            --install) IDE_INSTALL=1 ;;
+            "") ;;
+            *)
+              if [ -z "$IDE_ARG" ]; then
+                IDE_ARG="$arg"
+              elif [ -z "$PACK_ARG" ]; then
+                PACK_ARG="$arg"
+              fi
+              ;;
+          esac
+        done
+        if [ -z "$IDE_ARG" ] || [ -z "$PACK_ARG" ]; then
+          echo "Usage: peon packs ide-bind <ide> <pack> [--install]" >&2; exit 1
+        fi
+
+        if [ "$IDE_INSTALL" -eq 1 ]; then
+          PACK_DL="$(resolve_pack_download)" || exit 1
+          bash "$PACK_DL" --dir="$PEON_DIR" --packs="$PACK_ARG" || exit 1
+        fi
+
+        IDE_ARG="$IDE_ARG" PACK_ARG="$PACK_ARG" python3 -c "
+import json, os, sys
+
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
+ide_arg = os.environ.get('IDE_ARG', '')
+pack_arg = os.environ.get('PACK_ARG', '')
+packs_dir = os.path.join(os.environ.get('PEON_ENV_PEON_DIR', ''), 'packs')
+
+IDE_ALIASES = {
+    'claude': 'claude', 'claude-code': 'claude', 'claude_code': 'claude', 'claudecode': 'claude',
+    'codex': 'codex', 'openai-codex': 'codex', 'openai_codex': 'codex',
+    'cursor': 'cursor', 'opencode': 'opencode', 'open-code': 'opencode', 'open_code': 'opencode',
+    'kilo': 'kilo', 'kiro': 'kiro', 'gemini': 'gemini', 'copilot': 'copilot', 'windsurf': 'windsurf',
+    'kimi': 'kimi', 'antigravity': 'antigravity', 'amp': 'amp', 'deepagents': 'deepagents',
+    'deep-agents': 'deepagents', 'deep_agents': 'deepagents', 'openclaw': 'openclaw',
+    'open-claw': 'openclaw', 'open_claw': 'openclaw', 'rovodev': 'rovodev', 'rovo': 'rovodev',
+}
+KNOWN_IDES = ['claude', 'codex', 'cursor', 'opencode', 'kilo', 'kiro', 'gemini', 'copilot', 'windsurf',
+              'kimi', 'antigravity', 'amp', 'deepagents', 'openclaw', 'rovodev']
+
+def normalize_ide_id(value):
+    raw = str(value or '').strip().lower()
+    if not raw:
+        return ''
+    key = raw.replace(' ', '-').replace('_', '-')
+    return IDE_ALIASES.get(key, key)
+
+names = sorted([
+    d for d in os.listdir(packs_dir)
+    if os.path.isdir(os.path.join(packs_dir, d)) and (
+        os.path.exists(os.path.join(packs_dir, d, 'openpeon.json')) or
+        os.path.exists(os.path.join(packs_dir, d, 'manifest.json'))
+    )
+])
+if pack_arg not in names:
+    print(f'Error: pack \"{pack_arg}\" not found.', file=sys.stderr)
+    print(f'Available packs: {\", \".join(names)}', file=sys.stderr)
+    sys.exit(1)
+
+ide_id = normalize_ide_id(ide_arg)
+if not ide_id:
+    print('Error: IDE id must not be empty.', file=sys.stderr)
+    sys.exit(1)
+
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+
+rules = cfg.get('ide_rules', [])
+found = False
+for rule in rules:
+    if normalize_ide_id(rule.get('ide', '')) == ide_id:
+        rule['ide'] = ide_id
+        rule['pack'] = pack_arg
+        found = True
+        break
+if not found:
+    rules.append({'ide': ide_id, 'pack': pack_arg})
+
+cfg['ide_rules'] = rules
+json.dump(cfg, open(config_path, 'w'), indent=2)
+print(f'peon-ping: bound {pack_arg} to IDE {ide_id}')
+if ide_id not in KNOWN_IDES:
+    print('Known IDE ids: ' + ', '.join(KNOWN_IDES))
+" || exit 1
+        sync_adapter_configs; exit 0 ;;
+      ide-unbind)
+        IDE_ARG="${3:-}"
+        if [ -z "$IDE_ARG" ]; then
+          echo "Usage: peon packs ide-unbind <ide>" >&2; exit 1
+        fi
+        IDE_ARG="$IDE_ARG" python3 -c "
+import json, os
+
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
+ide_arg = os.environ.get('IDE_ARG', '')
+
+IDE_ALIASES = {
+    'claude': 'claude', 'claude-code': 'claude', 'claude_code': 'claude', 'claudecode': 'claude',
+    'codex': 'codex', 'openai-codex': 'codex', 'openai_codex': 'codex',
+    'cursor': 'cursor', 'opencode': 'opencode', 'open-code': 'opencode', 'open_code': 'opencode',
+    'kilo': 'kilo', 'kiro': 'kiro', 'gemini': 'gemini', 'copilot': 'copilot', 'windsurf': 'windsurf',
+    'kimi': 'kimi', 'antigravity': 'antigravity', 'amp': 'amp', 'deepagents': 'deepagents',
+    'deep-agents': 'deepagents', 'deep_agents': 'deepagents', 'openclaw': 'openclaw',
+    'open-claw': 'openclaw', 'open_claw': 'openclaw', 'rovodev': 'rovodev', 'rovo': 'rovodev',
+}
+
+def normalize_ide_id(value):
+    raw = str(value or '').strip().lower()
+    if not raw:
+        return ''
+    key = raw.replace(' ', '-').replace('_', '-')
+    return IDE_ALIASES.get(key, key)
+
+ide_id = normalize_ide_id(ide_arg)
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+
+rules = cfg.get('ide_rules', [])
+new_rules = [r for r in rules if normalize_ide_id(r.get('ide', '')) != ide_id]
+if len(new_rules) == len(rules):
+    print(f'No IDE binding found for \"{ide_id}\".')
+else:
+    cfg['ide_rules'] = new_rules
+    json.dump(cfg, open(config_path, 'w'), indent=2)
+    print(f'peon-ping: unbound IDE {ide_id}')
+" || exit 1
+        sync_adapter_configs; exit 0 ;;
+      ide-bindings)
+        python3 -c "
+import json, os
+
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
+state_path = os.path.join(os.environ.get('PEON_ENV_PEON_DIR', ''), '.state.json')
+current_ide = os.environ.get('PEON_IDE', '') or os.environ.get('PEON_SESSION_SOURCE', '') or os.environ.get('PEON_SOURCE', '') or 'claude'
+
+IDE_ALIASES = {
+    'claude': 'claude', 'claude-code': 'claude', 'claude_code': 'claude', 'claudecode': 'claude',
+    'codex': 'codex', 'openai-codex': 'codex', 'openai_codex': 'codex',
+    'cursor': 'cursor', 'opencode': 'opencode', 'open-code': 'opencode', 'open_code': 'opencode',
+    'kilo': 'kilo', 'kiro': 'kiro', 'gemini': 'gemini', 'copilot': 'copilot', 'windsurf': 'windsurf',
+    'kimi': 'kimi', 'antigravity': 'antigravity', 'amp': 'amp', 'deepagents': 'deepagents',
+    'deep-agents': 'deepagents', 'deep_agents': 'deepagents', 'openclaw': 'openclaw',
+    'open-claw': 'openclaw', 'open_claw': 'openclaw', 'rovodev': 'rovodev', 'rovo': 'rovodev',
+}
+KNOWN_IDES = ['claude', 'codex', 'cursor', 'opencode', 'kilo', 'kiro', 'gemini', 'copilot', 'windsurf',
+              'kimi', 'antigravity', 'amp', 'deepagents', 'openclaw', 'rovodev']
+
+def normalize_ide_id(value):
+    raw = str(value or '').strip().lower()
+    if not raw:
+        return ''
+    key = raw.replace(' ', '-').replace('_', '-')
+    return IDE_ALIASES.get(key, key)
+
+current_ide = normalize_ide_id(current_ide) or 'claude'
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+try:
+    state = json.load(open(state_path))
+except Exception:
+    state = {}
+
+rules = cfg.get('ide_rules', [])
+if not rules:
+    print('No IDE bindings configured.')
+else:
+    for rule in rules:
+        ide = normalize_ide_id(rule.get('ide', ''))
+        pack = rule.get('pack', '')
+        marker = ' *' if ide and ide == current_ide else ''
+        print(f'  {ide} -> {pack}{marker}')
+
+recent = state.get('recent_ide_sources', {})
+if isinstance(recent, dict) and recent:
+    ordered = [name for name, _ in sorted(recent.items(), key=lambda item: item[1], reverse=True)]
+    print('Recent IDEs: ' + ', '.join(ordered[:5]))
+print('Supported IDE ids: ' + ', '.join(KNOWN_IDES))
+"
+        exit 0 ;;
+      exclude)
+        EXCLUDE_ACTION="${3:-list}"
+        EXCLUDE_PATTERN="${4:-}"
+        EXCLUDE_ACTION="$EXCLUDE_ACTION" EXCLUDE_PATTERN="$EXCLUDE_PATTERN" python3 -c "
+import json, os, sys, fnmatch
+
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
+action = os.environ.get('EXCLUDE_ACTION', 'list')
+pattern = os.environ.get('EXCLUDE_PATTERN', '')
+cwd = os.getcwd()
+
+def normalize_path_value(value):
+    raw = str(value or '').strip()
+    if not raw:
+        return ''
+    return os.path.normpath(os.path.expanduser(raw))
+
+def path_pattern_matches(path_value, pattern):
+    path_norm = normalize_path_value(path_value)
+    pat_raw = str(pattern or '').strip()
+    if not path_norm or not pat_raw:
+        return False
+    pat = os.path.expanduser(pat_raw)
+    pat_norm = os.path.normpath(pat) if (pat.startswith('~') or '/' in pat) else pat
+    if fnmatch.fnmatch(path_norm, pat_norm):
+        return True
+    if not any(ch in pat_norm for ch in '*?['):
+        return path_norm == pat_norm or path_norm.startswith(pat_norm + os.sep)
+    return False
+
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+
+exclude_dirs = cfg.get('exclude_dirs', [])
+
+if action == 'add':
+    if not pattern:
+        print('Usage: peon packs exclude add <glob-or-dir>', file=sys.stderr)
+        sys.exit(1)
+    if pattern in exclude_dirs:
+        print(f'peon-ping: already silencing sounds in: {pattern}')
+    else:
+        exclude_dirs.append(pattern)
+        cfg['exclude_dirs'] = exclude_dirs
+        json.dump(cfg, open(config_path, 'w'), indent=2)
+        print(f'peon-ping: sounds & notifications silenced for {pattern}')
+elif action == 'remove':
+    if not pattern:
+        print('Usage: peon packs exclude remove <glob-or-dir>', file=sys.stderr)
+        sys.exit(1)
+    new_dirs = [item for item in exclude_dirs if item != pattern]
+    if len(new_dirs) == len(exclude_dirs):
+        print(f'No silenced path found for \"{pattern}\".')
+    else:
+        cfg['exclude_dirs'] = new_dirs
+        json.dump(cfg, open(config_path, 'w'), indent=2)
+        print(f'peon-ping: no longer silencing {pattern}')
+elif action == 'list':
+    if not exclude_dirs:
+        print('No silenced paths configured.')
+    else:
+        print('Silenced paths (no sounds or notifications when cwd matches):')
+        for item in exclude_dirs:
+            marker = ' *' if path_pattern_matches(cwd, item) else ''
+            print(f'  {item}{marker}')
+else:
+    print('Usage: peon packs exclude <add|remove|list> [glob-or-dir]', file=sys.stderr)
+    sys.exit(1)
+" || exit 1
+        sync_adapter_configs; exit 0 ;;
       next)
         python3 -c "
 import json, os, glob
@@ -2673,28 +3381,161 @@ print()
       *)
         echo "Usage: peon packs <list|use|next|install|install-local|remove|rotation|bind|unbind|bindings|community|search>" >&2; exit 1 ;;
     esac ;;
+  sounds)
+    SOUNDS_ACTION="${2:-}"
+    case "$SOUNDS_ACTION" in
+      list)
+        SOUNDS_PACK_ARG="${3:-}"
+        export PEON_ENV_SOUNDS_PACK="$SOUNDS_PACK_ARG"
+        python3 -c "
+import json, os, sys
+no_color = os.environ.get('NO_COLOR', '')
+CYAN = '' if no_color else '\033[36m'
+GREEN = '' if no_color else '\033[32m'
+RED = '' if no_color else '\033[31m'
+DIM = '' if no_color else '\033[90m'
+RST = '' if no_color else '\033[0m'
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
+peon_dir = os.environ.get('PEON_ENV_PEON_DIR', '')
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+pack = os.environ.get('PEON_ENV_SOUNDS_PACK', '') or cfg.get('default_pack', cfg.get('active_pack', 'peon'))
+pack_dir = os.path.join(peon_dir, 'packs', pack)
+manifest = None
+for mname in ('openpeon.json', 'manifest.json'):
+    mpath = os.path.join(pack_dir, mname)
+    if os.path.exists(mpath):
+        manifest = json.load(open(mpath))
+        break
+if not manifest:
+    print(f'Error: pack \"{pack}\" not found.', file=sys.stderr)
+    sys.exit(1)
+disabled_map = cfg.get('disabled_sounds', {}).get(pack, {})
+categories = manifest.get('categories', {})
+total = sum(len(c.get('sounds', [])) for c in categories.values())
+print()
+print(f'  {CYAN}Sounds in \"{pack}\" ({total} total){RST}')
+for cat in sorted(categories.keys()):
+    sounds = categories[cat].get('sounds', [])
+    if not sounds:
+        continue
+    disabled = set(disabled_map.get(cat, []) or [])
+    print()
+    print(f'  {CYAN}{cat}{RST}')
+    max_w = max(len(os.path.basename(str(s.get('file', '')))) for s in sounds) + 2
+    name_w = max(max_w, 28)
+    for s in sounds:
+        fname = os.path.basename(str(s.get('file', '')))
+        label = str(s.get('label', ''))
+        is_disabled = fname in disabled
+        marker = f'  {RED}<-- disabled{RST}' if is_disabled else ''
+        label_str = f'{DIM}{label}{RST}' if label else ''
+        print(f'    {fname:<{name_w}}{label_str}{marker}')
+print()
+"
+        exit $? ;;
+      disable|enable)
+        SOUNDS_CAT="${3:-}"
+        SOUNDS_FILE="${4:-}"
+        SOUNDS_PACK=""
+        for _a in "${@:5}"; do
+          case "$_a" in
+            --pack=*) SOUNDS_PACK="${_a#--pack=}" ;;
+          esac
+        done
+        if [ -z "$SOUNDS_CAT" ] || [ -z "$SOUNDS_FILE" ]; then
+          echo "Usage: peon sounds $SOUNDS_ACTION <category> <file> [--pack=<name>]" >&2; exit 1
+        fi
+        export PEON_ENV_SOUNDS_ACTION="$SOUNDS_ACTION"
+        export PEON_ENV_SOUNDS_CAT="$SOUNDS_CAT"
+        export PEON_ENV_SOUNDS_FILE="$SOUNDS_FILE"
+        export PEON_ENV_SOUNDS_PACK="$SOUNDS_PACK"
+        python3 -c "
+import json, os, sys
+config_path = os.environ.get('PEON_ENV_CONFIG', '')
+peon_dir = os.environ.get('PEON_ENV_PEON_DIR', '')
+action = os.environ.get('PEON_ENV_SOUNDS_ACTION', '')
+category = os.environ.get('PEON_ENV_SOUNDS_CAT', '')
+fname = os.path.basename(os.environ.get('PEON_ENV_SOUNDS_FILE', ''))
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    cfg = {}
+pack = os.environ.get('PEON_ENV_SOUNDS_PACK', '') or cfg.get('default_pack', cfg.get('active_pack', 'peon'))
+pack_dir = os.path.join(peon_dir, 'packs', pack)
+manifest = None
+for mname in ('openpeon.json', 'manifest.json'):
+    mpath = os.path.join(pack_dir, mname)
+    if os.path.exists(mpath):
+        manifest = json.load(open(mpath))
+        break
+if not manifest:
+    print(f'Error: pack \"{pack}\" not found.', file=sys.stderr)
+    sys.exit(1)
+cat_sounds = manifest.get('categories', {}).get(category, {}).get('sounds', [])
+if not cat_sounds:
+    print(f'Error: category \"{category}\" has no sounds in pack \"{pack}\".', file=sys.stderr)
+    sys.exit(1)
+valid = {os.path.basename(str(s.get('file', ''))) for s in cat_sounds}
+if fname not in valid:
+    print(f'Error: sound \"{fname}\" not found in {pack}/{category}.', file=sys.stderr)
+    print(f'Available: {\", \".join(sorted(valid))}', file=sys.stderr)
+    sys.exit(1)
+ds = cfg.setdefault('disabled_sounds', {})
+pack_map = ds.setdefault(pack, {})
+cur = list(pack_map.get(category, []) or [])
+if action == 'disable':
+    if fname not in cur:
+        cur.append(fname)
+    pack_map[category] = sorted(cur)
+    msg = f'peon-ping: disabled {fname} in {pack}/{category}'
+else:
+    cur = [f for f in cur if f != fname]
+    if cur:
+        pack_map[category] = sorted(cur)
+    else:
+        pack_map.pop(category, None)
+    if not pack_map:
+        ds.pop(pack, None)
+    if not ds:
+        cfg.pop('disabled_sounds', None)
+    msg = f'peon-ping: enabled {fname} in {pack}/{category}'
+json.dump(cfg, open(config_path, 'w'), indent=2)
+print(msg)
+"
+        _rc=$?; [ $_rc -eq 0 ] && sync_adapter_configs; exit $_rc ;;
+      *)
+        echo "Usage: peon sounds <list|disable|enable> [args]" >&2; exit 1 ;;
+    esac ;;
   mobile)
     case "${2:-}" in
       ntfy)
         TOPIC="${3:-}"
         if [ -z "$TOPIC" ]; then
-          echo "Usage: peon mobile ntfy <topic> [--server=URL] [--token=TOKEN]" >&2
+          echo "Usage: peon mobile ntfy <topic> [--server=URL] [--token=TOKEN] [--priority=max|urgent|high|default|low|min]" >&2
           echo "" >&2
           echo "Setup:" >&2
           echo "  1. Install ntfy app on your phone (ntfy.sh)" >&2
           echo "  2. Subscribe to your topic in the app" >&2
           echo "  3. Run: peon mobile ntfy my-unique-topic" >&2
+          echo "" >&2
+          echo "Tip: on iOS, lower priorities can arrive silently. Use" >&2
+          echo "     --priority=max for an audible alert on every event." >&2
           exit 1
         fi
         NTFY_SERVER="https://ntfy.sh"
         NTFY_TOKEN=""
+        NTFY_PRIORITY=""
         for arg in "${@:4}"; do
           case "$arg" in
-            --server=*) NTFY_SERVER="${arg#--server=}" ;;
-            --token=*)  NTFY_TOKEN="${arg#--token=}" ;;
+            --server=*)   NTFY_SERVER="${arg#--server=}" ;;
+            --token=*)    NTFY_TOKEN="${arg#--token=}" ;;
+            --priority=*) NTFY_PRIORITY="${arg#--priority=}" ;;
           esac
         done
-        export PEON_ENV_NTFY_TOPIC="$TOPIC" PEON_ENV_NTFY_SERVER="$NTFY_SERVER" PEON_ENV_NTFY_TOKEN="$NTFY_TOKEN"
+        export PEON_ENV_NTFY_TOPIC="$TOPIC" PEON_ENV_NTFY_SERVER="$NTFY_SERVER" PEON_ENV_NTFY_TOKEN="$NTFY_TOKEN" PEON_ENV_NTFY_PRIORITY="$NTFY_PRIORITY"
         python3 -c "
 import json, os
 config_path = os.environ.get('PEON_ENV_CONFIG', '')
@@ -2709,11 +3550,15 @@ cfg['mobile_notify'] = {
     'server': os.environ.get('PEON_ENV_NTFY_SERVER', 'https://ntfy.sh'),
     'token': os.environ.get('PEON_ENV_NTFY_TOKEN', '')
 }
+_prio = os.environ.get('PEON_ENV_NTFY_PRIORITY', '')
+if _prio:
+    cfg['mobile_notify']['priority'] = _prio
 json.dump(cfg, open(config_path, 'w'), indent=2)
 "
         echo "peon-ping: mobile notifications enabled via ntfy"
         echo "  Topic:  $TOPIC"
         echo "  Server: $NTFY_SERVER"
+        [ -n "$NTFY_PRIORITY" ] && echo "  Priority: $NTFY_PRIORITY"
         echo ""
         echo "Install the ntfy app and subscribe to '$TOPIC'"
         # Send test notification
@@ -2826,6 +3671,9 @@ else:
         server = mn.get('server', 'https://ntfy.sh')
         print(f'  Topic:  {topic}')
         print(f'  Server: {server}')
+        prio = mn.get('priority')
+        if prio:
+            print(f'  Priority: {prio}')
     elif service == 'pushover':
         ukey = mn.get('user_key', '?')
         print(f'  User:   {ukey[:8]}...')
@@ -3080,6 +3928,14 @@ if 'debug_retention_days' not in cfg:
     cfg['debug_retention_days'] = 7
     changed = True
     migrations.append('debug_retention_days')
+if 'exclude_dirs' not in cfg:
+    cfg['exclude_dirs'] = []
+    changed = True
+    migrations.append('exclude_dirs')
+if 'ide_rules' not in cfg:
+    cfg['ide_rules'] = []
+    changed = True
+    migrations.append('ide_rules')
 if 'notification_all_screens' not in cfg:
     _theme = cfg.get('overlay_theme', '')
     # Default overlay always showed on all screens; themed overlays (glass/jarvis/sakura) only showed on the focused screen
@@ -3090,6 +3946,26 @@ if 'notification_title_marker' not in cfg:
     cfg['notification_title_marker'] = '●'
     changed = True
     migrations.append('notification_title_marker')
+if 'suppress_idle_prompt_repeats' not in cfg:
+    cfg['suppress_idle_prompt_repeats'] = True
+    changed = True
+    migrations.append('suppress_idle_prompt_repeats')
+if 'idle_prompt_suppress_window_seconds' not in cfg:
+    cfg['idle_prompt_suppress_window_seconds'] = 3600
+    changed = True
+    migrations.append('idle_prompt_suppress_window_seconds')
+if 'notification_title_ide' not in cfg:
+    cfg['notification_title_ide'] = False
+    changed = True
+    migrations.append('notification_title_ide')
+if 'focus_detect' not in cfg:
+    cfg['focus_detect'] = False
+    changed = True
+    migrations.append('focus_detect')
+if 'focus_detect_mode' not in cfg:
+    cfg['focus_detect_mode'] = 'all'
+    changed = True
+    migrations.append('focus_detect_mode')
 if changed:
     json.dump(cfg, open(config_path, 'w'), indent=2)
     print('peon-ping: config keys updated (' + ', '.join(migrations) + ')')
@@ -3300,11 +4176,27 @@ Pack management:
   packs next              Cycle to the next pack
   packs remove <p1,p2>    Remove specific packs
   packs remove --all      Remove all packs except the active one
+  packs bind <name>       Bind a pack to the current directory
+  packs bind --pattern <g> Bind a pack to a path glob
+  packs unbind            Remove the current directory binding
+  packs unbind --pattern <g> Remove a specific path binding
+  packs bindings          List all path-based pack bindings
+  packs ide-bind <ide> <pack> [--install]  Bind a pack to an IDE id
+  packs ide-unbind <ide>  Remove an IDE binding
+  packs ide-bindings      List all IDE-based pack bindings
+  packs exclude add <g>   Silence sounds & notifications when cwd matches
+  packs exclude remove <g> Stop silencing the given path
+  packs exclude list      List silenced paths
   packs rotation list     Show current rotation list and mode
   packs rotation add <p>  Add pack(s) to rotation (comma-separated)
   packs rotation add --install <p>  Add to rotation, installing from registry if needed
   packs rotation remove <p> Remove pack(s) from rotation
   packs rotation clear    Clear all packs from rotation
+
+Sound management (per-sound toggles within a pack):
+  sounds list [pack]                      List sounds in a pack, marking disabled ones
+  sounds disable <cat> <file> [--pack=<p>] Disable a specific sound within a category
+  sounds enable <cat> <file> [--pack=<p>]  Re-enable a previously disabled sound
 
 Mobile notifications:
   mobile ntfy <topic>      Set up ntfy.sh push notifications
@@ -3962,8 +4854,15 @@ export PEON_ENV_HOOK_TTY="$_PEON_HOOK_TTY"
 # --- Single Python call: config, event parsing, agent detection, category routing, sound picking ---
 # Consolidates 5 separate python3 invocations into one for ~120-200ms faster hook response.
 # Outputs shell variables consumed by the bash play/notify/title logic below.
-_PEON_PYOUT=$(python3 -c "
-import sys, json, os, re, random, time, shlex, tempfile
+#
+# Body is written to a tempfile and invoked by path. Passing this block via
+# `python3 -c` overflows the Windows CreateProcess argv limit (~32 KB) on
+# msys2/git-bash, causing silent E2BIG and a hook that exits 0 with no logs.
+# See https://github.com/PeonPing/peon-ping/issues/488
+_PEON_PY_TMP=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/peon-py-$$.py")
+trap 'rm -f "$_PEON_PY_TMP"' EXIT
+cat > "$_PEON_PY_TMP" <<PEON_LOCAL_PY_EOF
+import sys, json, os, re, random, time, shlex, tempfile, fnmatch
 q = shlex.quote
 _peon_start = time.monotonic()
 
@@ -4050,6 +4949,62 @@ else:
 if _config_error:
     log('config', error=_config_error, fallback='defaults')
 
+# --- Parse event JSON from stdin ---
+event_data = json.load(sys.stdin)
+
+# Normalize camelCase aliases to snake_case so the rest of this script
+# stays simple. GitHub Copilot CLI's permissionRequest event leaks
+# camelCase fields ("hookName", "sessionId", "toolName", "toolInput")
+# even when registered with the PascalCase event key that should
+# produce the VS Code-compatible payload. Without this normalization,
+# every Copilot CLI permission popup goes silent. Defensive - covers
+# any future camelCase-leaky surface as well.
+_camel_to_snake = {
+    'hookName': 'hook_event_name',
+    'sessionId': 'session_id',
+    'toolName': 'tool_name',
+    'toolInput': 'tool_input',
+    'toolArgs': 'tool_input',
+    'toolResult': 'tool_result',
+    'permissionMode': 'permission_mode',
+    'notificationType': 'notification_type',
+    'transcriptPath': 'transcript_path',
+    'stopReason': 'stop_reason',
+    'agentName': 'agent_name',
+    'initialPrompt': 'initial_prompt',
+    'workspaceRoots': 'workspace_roots',
+}
+for _camel, _snake in _camel_to_snake.items():
+    if _camel in event_data and not event_data.get(_snake):
+        event_data[_snake] = event_data[_camel]
+
+raw_event = event_data.get('hook_event_name', '')
+session_source = event_data.get('source', '')
+
+opencode_cfg = os.path.join(os.environ.get('XDG_CONFIG_HOME', os.path.join(os.path.expanduser('~'), '.config')), 'opencode', 'peon-ping', 'config.json')
+session_source_key = str(session_source or '').strip().lower().replace(' ', '-').replace('_', '-')
+if session_source_key in ('opencode', 'open-code'):
+    session_source_key = 'opencode'
+if session_source_key == 'opencode' and os.path.isfile(opencode_cfg):
+    try:
+        opencode_override = json.load(open(opencode_cfg))
+    except Exception:
+        opencode_override = {}
+    if isinstance(opencode_override, dict):
+        for key in ('default_pack', 'active_pack', 'volume', 'enabled', 'desktop_notifications',
+                    'pack_rotation', 'pack_rotation_mode', 'path_rules', 'exclude_dirs',
+                    'ide_rules', 'mobile_notify'):
+            if key in opencode_override:
+                cfg[key] = opencode_override[key]
+        if isinstance(opencode_override.get('categories'), dict):
+            merged_categories = dict(cfg.get('categories', {}) or {})
+            merged_categories.update(opencode_override['categories'])
+            cfg['categories'] = merged_categories
+        if 'spam_threshold' in opencode_override:
+            cfg['annoyed_threshold'] = opencode_override['spam_threshold']
+        if 'spam_window_seconds' in opencode_override:
+            cfg['annoyed_window_seconds'] = opencode_override['spam_window_seconds']
+
 volume = cfg.get('volume', 0.5)
 desktop_notif = cfg.get('desktop_notifications', True)
 use_sound_effects_device = cfg.get('use_sound_effects_device', True)
@@ -4058,14 +5013,25 @@ tab_color_cfg = cfg.get('tab_color', {})
 tab_color_enabled = str(tab_color_cfg.get('enabled', True)).lower() != 'false'
 active_pack = cfg.get('default_pack', cfg.get('active_pack', 'peon'))
 pack_rotation = cfg.get('pack_rotation', [])
-annoyed_threshold = int(cfg.get('annoyed_threshold', 3))
-annoyed_window = float(cfg.get('annoyed_window_seconds', 10))
+annoyed_threshold = int(cfg.get('annoyed_threshold', cfg.get('spam_threshold', 3)))
+annoyed_window = float(cfg.get('annoyed_window_seconds', cfg.get('spam_window_seconds', 10)))
 silent_window = float(cfg.get('silent_window_seconds', 0))
 suppress_subagent_complete = str(cfg.get('suppress_subagent_complete', False)).lower() == 'true'
 suppress_delegate = str(cfg.get('suppress_delegate_sessions', False)).lower() == 'true'
 headphones_only = str(cfg.get('headphones_only', False)).lower() == 'true'
 meeting_detect = str(cfg.get('meeting_detect', False)).lower() == 'true'
+focus_detect = str(cfg.get('focus_detect', False)).lower() == 'true'
+focus_detect_mode = str(cfg.get('focus_detect_mode', 'all')).lower()
+if focus_detect_mode not in ('all', 'sound', 'notifications'):
+    focus_detect_mode = 'all'
+terminal_tab_title = str(cfg.get('terminal_tab_title', True)).lower() != 'false'
 suppress_sound_when_tab_focused = str(cfg.get('suppress_sound_when_tab_focused', False)).lower() == 'true'
+# Opt-in passthrough of the tab title/color escapes through tmux's DCS wrapper.
+# Default off: a tmux client multiplexes many panes onto ONE host terminal tab,
+# so with several concurrent sessions these escapes (which have no per-pane
+# addressing) stomp the single shared tab on a last-writer-wins basis — including
+# from background panes. Off keeps per-session state where tmux can scope it.
+tmux_passthrough = str(cfg.get('tmux_passthrough', False)).lower() == 'true'
 
 log('config', loaded=config_path, volume=volume, pack=active_pack, enabled=True)
 
@@ -4076,13 +5042,12 @@ for c in ['session.start','task.acknowledge','task.complete','task.error','input
     default = False if c in default_off else True
     cat_enabled[c] = str(cats.get(c, default)).lower() == 'true'
 
-# --- Parse event JSON from stdin ---
-event_data = json.load(sys.stdin)
-raw_event = event_data.get('hook_event_name', '')
-
 # Cursor IDE sends lowercase camelCase event names via its Third-party skills
 # (Claude Code compatibility) mode. Map them to the PascalCase names used below.
 # Claude Code's own PascalCase names pass through unchanged via dict.get fallback.
+# Copilot CLI usually sends PascalCase (when registered with PascalCase keys),
+# but its permissionRequest event leaks camelCase as of CLI 1.0.48-1; the
+# Copilot fallbacks below let those through too.
 _cursor_event_map = {
     'sessionStart': 'SessionStart',
     'sessionEnd': 'SessionEnd',
@@ -4093,6 +5058,12 @@ _cursor_event_map = {
     'subagentStop': 'SubagentStop',
     'subagentStart': 'SubagentStart',
     'preCompact': 'PreCompact',
+    # Copilot CLI camelCase fallbacks
+    'permissionRequest': 'PermissionRequest',
+    'notification': 'Notification',
+    'agentStop': 'Stop',
+    'userPromptSubmitted': 'UserPromptSubmit',
+    'postToolUseFailure': 'PostToolUseFailure',
 }
 event = _cursor_event_map.get(raw_event, raw_event)
 
@@ -4103,8 +5074,156 @@ cwd = event_data.get('cwd', '') or (_roots[0] if _roots else '')
 session_id = event_data.get('session_id', '') or event_data.get('conversation_id', '')
 perm_mode = event_data.get('permission_mode', '')
 session_source = event_data.get('source', '')
+# Claude Code sets agent_id only on hook events fired from inside a Task-tool
+# subagent (PostToolUseFailure, PermissionRequest, ...); absent on parent events
+agent_id = event_data.get('agent_id', '')
+
+IDE_ALIASES = {
+    'claude': 'claude',
+    'claude-code': 'claude',
+    'claude_code': 'claude',
+    'claudecode': 'claude',
+    'codex': 'codex',
+    'openai-codex': 'codex',
+    'openai_codex': 'codex',
+    'cursor': 'cursor',
+    'opencode': 'opencode',
+    'open-code': 'opencode',
+    'open_code': 'opencode',
+    'kilo': 'kilo',
+    'kiro': 'kiro',
+    'gemini': 'gemini',
+    'copilot': 'copilot',
+    'windsurf': 'windsurf',
+    'kimi': 'kimi',
+    'antigravity': 'antigravity',
+    'amp': 'amp',
+    'deepagents': 'deepagents',
+    'deep-agents': 'deepagents',
+    'deep_agents': 'deepagents',
+    'openclaw': 'openclaw',
+    'open-claw': 'openclaw',
+    'open_claw': 'openclaw',
+    'rovodev': 'rovodev',
+    'rovo': 'rovodev',
+    'omp': 'omp',
+    'oh-my-pi': 'omp',
+    'oh_my_pi': 'omp',
+    'pi': 'omp',
+    'qwen': 'qwen',
+    'qwen-code': 'qwen',
+    'iflow': 'iflow',
+    'iflow-cli': 'iflow',
+    'trae': 'trae',
+    'kiro-ide': 'kiro-ide',
+    'eca': 'eca',
+}
+
+def normalize_ide_id(value):
+    raw = str(value or '').strip().lower()
+    if not raw:
+        return ''
+    key = raw.replace(' ', '-').replace('_', '-')
+    return IDE_ALIASES.get(key, key)
+
+def detect_session_ide(source_value, event_payload, session_value):
+    source_key = normalize_ide_id(source_value)
+    if source_key and source_key not in ('resume', 'compact'):
+        return source_key
+    if event_payload.get('workspace_roots'):
+        return 'cursor'
+    sid = str(session_value or '').lower()
+    prefix_map = (
+        ('codex-', 'codex'),
+        ('cursor-', 'cursor'),
+        ('oc-', 'opencode'),
+        ('kilo-', 'kilo'),
+        ('kiro-ide-', 'kiro-ide'),
+        ('kiro-', 'kiro'),
+        ('gemini-', 'gemini'),
+        ('copilot-', 'copilot'),
+        ('windsurf-', 'windsurf'),
+        ('kimi-', 'kimi'),
+        ('antigravity-', 'antigravity'),
+        ('amp-', 'amp'),
+        ('deepagents-', 'deepagents'),
+        ('openclaw-', 'openclaw'),
+        ('rovodev-', 'rovodev'),
+        ('omp-', 'omp'),
+        ('qwen-', 'qwen'),
+        ('iflow-', 'iflow'),
+        ('trae-', 'trae'),
+        ('eca-', 'eca'),
+    )
+    for prefix, ide in prefix_map:
+        if sid.startswith(prefix):
+            return ide
+    return 'claude'
+
+IDE_DISPLAY_NAMES = {
+    'claude': 'Claude Code',
+    'codex': 'OpenAI Codex',
+    'cursor': 'Cursor',
+    'opencode': 'OpenCode',
+    'kilo': 'Kilo CLI',
+    'kiro': 'Kiro',
+    'gemini': 'Gemini CLI',
+    'copilot': 'GitHub Copilot',
+    'windsurf': 'Windsurf',
+    'kimi': 'Kimi Code',
+    'antigravity': 'Antigravity',
+    'amp': 'Amp',
+    'deepagents': 'DeepAgents',
+    'openclaw': 'OpenClaw',
+    'rovodev': 'Rovo Dev CLI',
+    'omp': 'oh-my-pi',
+    'qwen': 'Qwen Code',
+    'iflow': 'iFlow CLI',
+    'trae': 'Trae',
+    'kiro-ide': 'Kiro IDE',
+    'eca': 'ECA',
+}
+
+def display_ide_name(ide_id):
+    key = normalize_ide_id(ide_id)
+    if not key:
+        return ''
+    return IDE_DISPLAY_NAMES.get(key, key.replace('-', ' ').title())
+
+def normalize_path_value(value):
+    raw = str(value or '').strip()
+    if not raw:
+        return ''
+    return os.path.normpath(os.path.expanduser(raw))
+
+def path_pattern_matches(path_value, pattern):
+    path_norm = normalize_path_value(path_value)
+    pat_raw = str(pattern or '').strip()
+    if not path_norm or not pat_raw:
+        return False
+    pat = os.path.expanduser(pat_raw)
+    pat_norm = os.path.normpath(pat) if (pat.startswith('~') or '/' in pat) else pat
+    if fnmatch.fnmatch(path_norm, pat_norm):
+        return True
+    if not any(ch in pat_norm for ch in '*?['):
+        return path_norm == pat_norm or path_norm.startswith(pat_norm + os.sep)
+    return False
+
+session_ide = detect_session_ide(session_source, event_data, session_id)
 
 log('hook', event=event, session=session_id, cwd=cwd, paused=paused)
+
+# --- exclude_dirs: silence all sounds/notifications when cwd matches ---
+# Checked before state load so excluded dirs are cheap no-ops.
+_excluded_dir_pattern = next(
+    (pat for pat in (cfg.get('exclude_dirs', []) or []) if path_pattern_matches(cwd, pat)),
+    None,
+)
+if _excluded_dir_pattern:
+    log('route', category='none', suppressed=True, reason='excluded_dir', pattern=_excluded_dir_pattern)
+    log('exit', duration_ms=int((time.monotonic() - _peon_start) * 1000), exit=0)
+    print('PEON_EXIT=true')
+    sys.exit(0)
 
 # --- Load state ---
 state = read_state(state_file)
@@ -4152,19 +5271,41 @@ if session_packs != state.get('session_packs', {}):
     state['session_packs'] = session_packs
     state_dirty = True
 
+recent_ide_sources = state.get('recent_ide_sources', {})
+if not isinstance(recent_ide_sources, dict):
+    recent_ide_sources = {}
+recent_ide_sources[session_ide] = now
+recent_cutoff = now - 30 * 86400
+recent_ide_sources = dict(
+    (ide, ts) for ide, ts in recent_ide_sources.items()
+    if isinstance(ts, (int, float)) and ts > recent_cutoff
+)
+if recent_ide_sources != state.get('recent_ide_sources', {}):
+    state['recent_ide_sources'] = recent_ide_sources
+    state_dirty = True
+
 # --- Pack rotation: pin a pack per session ---
 rotation_mode = cfg.get('pack_rotation_mode', 'random')
 
-# --- Path rules: first glob match wins (layer 3 in override hierarchy) ---
-# Beats rotation and default_pack; loses to session_override and local config.
-import fnmatch
+# --- Path rules and IDE rules: first match wins in each layer ---
+# session_override > path_rules > ide_rules > rotation > default_pack
+# Note: exclude_dirs is handled earlier as a full silence short-circuit.
 _path_rule_pack = None
 for _rule in cfg.get('path_rules', []):
     _pat = _rule.get('pattern', '')
     _candidate = _rule.get('pack', '')
-    if cwd and _pat and _candidate and fnmatch.fnmatch(cwd, _pat):
+    if cwd and _pat and _candidate and path_pattern_matches(cwd, _pat):
         if os.path.isdir(os.path.join(peon_dir, 'packs', _candidate)):
             _path_rule_pack = _candidate
+            break
+
+_ide_rule_pack = None
+for _rule in cfg.get('ide_rules', []):
+    _ide = normalize_ide_id(_rule.get('ide', ''))
+    _candidate = _rule.get('pack', '')
+    if session_ide and _ide and _candidate and session_ide == _ide:
+        if os.path.isdir(os.path.join(peon_dir, 'packs', _candidate)):
+            _ide_rule_pack = _candidate
             break
 
 _default_pack = cfg.get('default_pack', cfg.get('active_pack', 'peon'))
@@ -4189,7 +5330,7 @@ if rotation_mode in ('session_override', 'agentskill'):
             state_dirty = True
         else:
             # Pack was deleted or invalid, fall through hierarchy
-            active_pack = _path_rule_pack or _default_pack
+            active_pack = _path_rule_pack or _ide_rule_pack or _default_pack
             # Clean up invalid entry
             del session_packs[session_id]
             state['session_packs'] = session_packs
@@ -4203,14 +5344,17 @@ if rotation_mode in ('session_override', 'agentskill'):
             if candidate and os.path.isdir(candidate_dir):
                 active_pack = candidate
             else:
-                active_pack = _path_rule_pack or _default_pack
+                active_pack = _path_rule_pack or _ide_rule_pack or _default_pack
         else:
-            active_pack = _path_rule_pack or _default_pack
+            active_pack = _path_rule_pack or _ide_rule_pack or _default_pack
+elif _path_rule_pack:
+    # Path rule beats IDE rules, rotation, and default.
+    active_pack = _path_rule_pack
+elif _ide_rule_pack:
+    # IDE rule beats rotation and default when no path rule matched.
+    active_pack = _ide_rule_pack
 elif pack_rotation and rotation_mode in ('random', 'round-robin', 'shuffle'):
-    if _path_rule_pack:
-        # Path rule beats rotation
-        active_pack = _path_rule_pack
-    elif rotation_mode == 'shuffle':
+    if rotation_mode == 'shuffle':
         # Shuffle: pick a random pack for every sound event, no session caching
         active_pack = random.choice(pack_rotation)
     else:
@@ -4264,8 +5408,8 @@ elif pack_rotation and rotation_mode in ('random', 'round-robin', 'shuffle'):
             state['session_packs'] = session_packs
             state_dirty = True
 else:
-    # Default: path_rule if matched, otherwise default_pack
-    active_pack = _path_rule_pack or _default_pack
+    # Default: path/IDE rule if matched, otherwise default_pack
+    active_pack = _path_rule_pack or _ide_rule_pack or _default_pack
 
 # --- Track last active session for context-reset detection ---
 state['last_active'] = dict(session_id=session_id, pack=active_pack,
@@ -4274,6 +5418,7 @@ state_dirty = True
 
 # --- Project name (priority chain: session_names[id] > CLAUDE_SESSION_NAME > .peon-label > notification_title_script > project_name_map > title_override > git repo > folder) ---
 project = None
+project_from_title_override = False
 
 # -1. State-based session name (set via /peon-ping-rename, highest priority)
 if session_id:
@@ -4309,7 +5454,8 @@ if not project:
         try:
             import subprocess as _sp
             _env = {**os.environ, 'PEON_SESSION_ID': session_id or '', 'PEON_CWD': cwd or '',
-                    'PEON_HOOK_EVENT': event or '', 'PEON_SESSION_NAME': os.environ.get('CLAUDE_SESSION_NAME', '')}
+                    'PEON_HOOK_EVENT': event or '', 'PEON_IDE': session_ide or '',
+                    'PEON_SESSION_NAME': os.environ.get('CLAUDE_SESSION_NAME', '')}
             _r = _sp.run(_script, shell=True, capture_output=True, text=True, timeout=2, env=_env)
             _out = _r.stdout.strip()[:50]
             if _r.returncode == 0 and _out:
@@ -4326,7 +5472,9 @@ if not project:
 # 3. Static override
 if not project:
     _ov = cfg.get('notification_title_override', '')
-    if _ov: project = str(_ov)[:50]
+    if _ov:
+        project = str(_ov)[:50]
+        project_from_title_override = True
 
 # 4. Git repo name
 if not project and cwd:
@@ -4347,11 +5495,56 @@ if not project:
     # Codex adapter can emit empty/root cwd when launched outside a workspace.
     # Keep labels agent-specific instead of falling back to "claude".
     _bundle = os.environ.get('__CFBundleIdentifier', '')
-    if str(session_source).lower() == 'codex' or str(session_id).startswith('codex-') or _bundle == 'com.openai.codex':
+    if session_ide == 'codex' or str(session_id).startswith('codex-') or _bundle == 'com.openai.codex':
         project = 'codex'
     else:
         project = 'claude'
 project = re.sub(r'[^a-zA-Z0-9 ._-]', '', project)
+ide_label = display_ide_name(session_ide)
+notification_project = f'{project} - {ide_label}' if cfg.get('notification_title_ide', False) and ide_label else project
+
+cmux_session = (
+    bool(os.environ.get('CMUX_SURFACE_ID') or os.environ.get('CMUX_PANEL_ID')) and
+    bool(os.environ.get('CMUX_WORKSPACE_ID'))
+)
+cmux_notification_path = cmux_session and cfg.get('notification_style', 'overlay') == 'standard'
+
+def first_excerpt(*values):
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        cleaned = re.sub(r'\s+', ' ', value).strip()
+        if cleaned:
+            return cleaned[:120]
+    return ''
+
+message_excerpt = first_excerpt(
+    event_data.get('transcript_summary', ''),
+    event_data.get('summary', ''),
+    event_data.get('last-assistant-message', ''),
+    event_data.get('last_assistant_message', ''),
+    event_data.get('message', ''),
+    event_data.get('body', ''),
+    event_data.get('text', ''),
+)
+
+def notification_message(status_value, *details):
+    parts = [str(status_value or '').strip()]
+    parts.extend(str(detail or '').strip() for detail in details)
+    parts = [part for part in parts if part]
+    if cmux_notification_path:
+        if message_excerpt:
+            return message_excerpt
+        if parts:
+            if parts[0] == 'done':
+                return 'Idle'
+            if parts[0] == 'question':
+                return parts[1] if len(parts) > 1 else 'Question pending'
+            if parts[0] == 'needs approval':
+                return 'Requires permissions'
+    if len(parts) <= 1:
+        return parts[0] if parts else ''
+    return parts[0] + ': ' + ' - '.join(parts[1:])
 
 # --- Event routing ---
 category = ''
@@ -4381,6 +5574,23 @@ if event in _dismiss_events and session_id and cfg.get('notification_stacking', 
             os.unlink(_sf)
         except Exception:
             pass
+
+# --- Subagent suppression via agent_id ---
+# Events fired from inside a subagent are identified directly by the agent_id
+# field, so no SubagentStart/SessionStart timing heuristic is needed and
+# parallel subagents cannot race the single pending_subagent_pack slot. This
+# sits after the auto-dismiss block so subagent tool activity still clears
+# stale notifications. SubagentStart/SubagentStop are excluded: their handlers
+# below cover pack inheritance and the flag-gated completion sound.
+if suppress_subagent_complete and agent_id and event not in ('SubagentStart', 'SubagentStop'):
+    log('route', category='none', suppressed=True, reason='subagent_event')
+    log('exit', duration_ms=int((time.monotonic() - _peon_start) * 1000), exit=0)
+    write_state(state, state_file)
+    print('PROJECT=' + q(project or ''))
+    print('STATUS=working')
+    print('MARKER=')
+    print('PEON_EXIT=true')
+    sys.exit(0)
 
 if event == 'SessionStart':
     source = event_data.get('source', '')
@@ -4440,7 +5650,7 @@ elif event == 'Stop':
         marker = '\u25cf '
         notify = '1'
         notify_color = 'blue'
-        msg = project
+        msg = notification_message(status)
         msg_subtitle = ''
     else:
         category = ''
@@ -4455,14 +5665,14 @@ elif event == 'Notification':
         marker = '\u25cf '
         notify = '1'
         notify_color = 'yellow'
-        msg = project
+        msg = notification_message(status)
     elif ntype == 'elicitation_dialog':
         category = 'input.required'
         status = 'question'
         marker = '\u25cf '
         notify = '1'
         notify_color = 'blue'
-        msg = project
+        msg = notification_message(status, 'Question pending')
         msg_subtitle = 'Question pending'
     else:
         # Unknown notification type — maintain tab title (e.g. plan mode events)
@@ -4486,14 +5696,18 @@ elif event == 'PermissionRequest':
     marker = '\u25cf '
     notify = '1'
     notify_color = 'red'
-    msg = project
     _tool = event_data.get('tool_name', '')
-    msg_subtitle = _tool
+    msg = notification_message(status, _tool)
 elif event == 'PostToolUseFailure':
     # Bash failures arrive here with error field (e.g. Exit code 1)
     tool_name = event_data.get('tool_name', '')
     error_msg = event_data.get('error', '')
-    if tool_name == 'Bash' and error_msg:
+    # Claude Code labels the shell tool "Bash" and fires PostToolUseFailure for
+    # every tool, so it is gated to Bash to avoid noise. Copilot CLI instead
+    # sends lowercase "bash" or "unknown" (for its generic errorOccurred event)
+    # and only surfaces real failures, so any Copilot-sourced failure with an
+    # error message should sound task.error. Claude Code behavior is unchanged.
+    if error_msg and (tool_name == 'Bash' or session_source == 'copilot'):
         category = 'task.error'
         status = 'error'
     else:
@@ -4522,7 +5736,7 @@ elif event == 'SubagentStop':
     marker = '\u25cf '
     notify = '1'
     notify_color = 'blue'
-    msg = project
+    msg = notification_message(status)
     msg_subtitle = ''
 elif event == 'SubagentStart':
     # Record parent's pack so spawned subagent sessions inherit it, then stay silent
@@ -4540,14 +5754,14 @@ elif event == 'SubagentStart':
 elif event == 'PreCompact':
     # Context window filling up — compaction about to start
     category = 'resource.limit'
-    status = 'working'
+    status = 'compacting'
     marker = '\u25cf '
     notify = '1'
     notify_color = 'red'
-    msg = project + '  \u2014  Context compacting'
+    msg = notification_message(status, 'Context compacting')
 elif event == 'SessionEnd':
     # Clean up state for this session
-    for key in ('session_packs', 'prompt_timestamps', 'session_start_times', 'prompt_start_times', 'subagent_sessions'):
+    for key in ('session_packs', 'prompt_timestamps', 'session_start_times', 'prompt_start_times', 'subagent_sessions', 'last_task_complete'):
         d = state.get(key, {})
         if session_id in d:
             del d[session_id]
@@ -4585,6 +5799,29 @@ if event == 'Stop':
     state['last_stop_time'] = now
     state_dirty = True
 
+# --- Dedupe idle_prompt repeats against a recent task.complete (issue #486) ---
+# Claude Code re-fires Notification+idle_prompt every ~60s while the terminal is
+# unfocused. Without dedupe, the task.complete sound replays on every poke. Suppress
+# when a task.complete already fired for the same session inside the configured window.
+# Skip when session_id is empty: adapters that omit it would otherwise share a single
+# bucket and cross-suppress unrelated terminals.
+if (event == 'Notification' and ntype == 'idle_prompt'
+        and category == 'task.complete'
+        and session_id
+        and cfg.get('suppress_idle_prompt_repeats', True)):
+    _idle_window = float(cfg.get('idle_prompt_suppress_window_seconds', 3600) or 0)
+    if _idle_window > 0:
+        _last_tc_map = state.get('last_task_complete', {}) or {}
+        try:
+            _prev_tc = float(_last_tc_map.get(session_id, 0) or 0)
+        except (TypeError, ValueError):
+            # Hand-edited state with a non-numeric value — treat as no record.
+            _prev_tc = 0.0
+        if _prev_tc and (time.time() - _prev_tc) < _idle_window:
+            log('route', category='task.complete', suppressed=True, reason='idle_prompt_repeat')
+            category = ''
+            notify = ''
+
 # --- Suppress sounds during session replay (claude -c) ---
 # When continuing a session, Claude fires SessionStart then immediately replays
 # old events. Suppress all sounds within 3s of SessionStart for the same session.
@@ -4621,6 +5858,24 @@ if category and not cat_enabled.get(category, True):
     notify = ''
     notify_color = ''
 
+# --- Track most recent task.complete fire per session (powers idle_prompt dedupe) ---
+# Only record when session_id is non-empty so unrelated sessions without an id
+# (some adapters omit it) don't clobber each other's bucket.
+if category == 'task.complete' and session_id and not paused:
+    _last_tc_map = state.get('last_task_complete', {}) or {}
+    _last_tc_map[session_id] = time.time()
+    # Prune entries older than the suppression window to avoid unbounded growth
+    # (mirrors the subagent_sessions pruning pattern above).
+    _prune_window = float(cfg.get('idle_prompt_suppress_window_seconds', 3600) or 0)
+    if _prune_window > 0:
+        _now_ts = time.time()
+        _last_tc_map = dict(
+            (sid, ts) for sid, ts in _last_tc_map.items()
+            if isinstance(ts, (int, float)) and _now_ts - ts < _prune_window
+        )
+    state['last_task_complete'] = _last_tc_map
+    state_dirty = True
+
 # --- Log route decision ---
 if category:
     _route_reason = 'paused' if paused else ''
@@ -4645,6 +5900,9 @@ if category and not paused:
         if not manifest:
             manifest = {}
         sounds = manifest.get('categories', {}).get(category, {}).get('sounds', [])
+        disabled_list = cfg.get('disabled_sounds', {}).get(active_pack, {}).get(category, []) or []
+        if disabled_list:
+            sounds = [s for s in sounds if os.path.basename(str(s.get('file', ''))) not in disabled_list]
         if sounds:
             last_played = state.get('last_played', {})
             last_file = last_played.get(category, '')
@@ -4834,6 +6092,21 @@ if tab_color_enabled:
 
 # --- Notification message template resolution ---
 from collections import defaultdict as _defaultdict
+def _template_summary(d):
+    for key in (
+        'last_assistant_message',
+        'last-assistant-message',
+        'prompt_response',
+        'transcript_summary',
+        'message',
+    ):
+        value = d.get(key, '')
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                return value[:120]
+    return ''
+
 _templates = cfg.get('notification_templates', {})
 _tpl_key_map = {
     'task.complete': 'stop',
@@ -4848,10 +6121,13 @@ elif event == 'PermissionRequest':
 _tpl = _templates.get(_tpl_key, '')
 _tpl_vars = _defaultdict(str, {
     'project': project,
-    'summary': event_data.get('transcript_summary', '').strip()[:120],
+    'summary': _template_summary(event_data),
+    'excerpt': message_excerpt,
     'tool_name': event_data.get('tool_name', ''),
     'status': status,
     'event': event,
+    'ide': ide_label,
+    'ide_id': session_ide,
 })
 if _tpl:
     try:
@@ -4911,6 +6187,9 @@ print('PEON_EXIT=false')
 print('EVENT=' + q(event))
 print('VOLUME=' + q(str(volume)))
 print('PROJECT=' + q(project))
+print('PROJECT_FROM_TITLE_OVERRIDE=' + ('true' if project_from_title_override else 'false'))
+print('IDE_LABEL=' + q(ide_label))
+print('NOTIFICATION_TITLE_IDE=' + ('true' if cfg.get('notification_title_ide', False) else 'false'))
 print('CWD=' + q(cwd))
 print('STATUS=' + q(status))
 print('MARKER=' + q(marker))
@@ -4925,6 +6204,7 @@ elif event == 'Notification':
     elif ntype == 'elicitation_dialog': _notify_type = 'question'
 print('NOTIFY_TYPE=' + q(_notify_type))
 print('MSG=' + q(msg))
+print('NOTIFY_PROJECT=' + q(notification_project))
 print('MSG_SUBTITLE=' + q(msg_subtitle))
 print('DESKTOP_NOTIF=' + ('true' if desktop_notif else 'false'))
 print('NOTIF_STYLE=' + q(cfg.get('notification_style', 'overlay')))
@@ -4943,6 +6223,10 @@ mobile_on = bool(mn and mn.get('service') and mn.get('enabled', True))
 print('MOBILE_NOTIF=' + ('true' if mobile_on else 'false'))
 print('HEADPHONES_ONLY=' + ('true' if headphones_only else 'false'))
 print('MEETING_DETECT=' + ('true' if meeting_detect else 'false'))
+print('FOCUS_DETECT=' + ('true' if focus_detect else 'false'))
+print('FOCUS_DETECT_MODE=' + q(focus_detect_mode))
+print('TERMINAL_TAB_TITLE=' + ('true' if terminal_tab_title else 'false'))
+print('TMUX_PASSTHROUGH=' + ('true' if tmux_passthrough else 'false'))
 print('SUPPRESS_SOUND_WHEN_TAB_FOCUSED=' + ('true' if suppress_sound_when_tab_focused else 'false'))
 print('SOUND_FILE=' + q(sound_file))
 print('ICON_PATH=' + q(icon_path))
@@ -4961,8 +6245,30 @@ print('TAB_COLOR_RGB=' + q(tab_color_rgb))
 _auto_debug = cfg.get('debug', False) or os.environ.get('PEON_DEBUG') == '1'
 if _auto_debug:
     print('PEON_AUTO_PRUNE=' + q(str(cfg.get('debug_retention_days', 7))))
-" <<< "$INPUT" 2>/dev/null)
+PEON_LOCAL_PY_EOF
+# Stderr intentionally NOT suppressed: silent failures here masked issue #488
+# for multiple releases. Any future exec error will surface in `peon debug`.
+_PEON_PYOUT=$(python3 "$_PEON_PY_TMP" <<< "$INPUT")
 eval "$_PEON_PYOUT"
+
+# --- Override PROJECT with cmux workspace title ---
+# A cmux workspace's title is set by the user and doesn't have to match cwd/git
+# remote, so ask cmux directly when CMUX_WORKSPACE_ID is in the env.
+if [ "${PROJECT_FROM_TITLE_OVERRIDE:-false}" != "true" ] && [ -n "${CMUX_WORKSPACE_ID:-}" ] && [ -n "${MSG:-}" ]; then
+  _cmux_workspace_field_helper="$(find_bundled_script "cmux-workspace-field.sh")" 2>/dev/null || _cmux_workspace_field_helper=""
+  if [ -n "$_cmux_workspace_field_helper" ]; then
+    _cmux_title=$(bash "$_cmux_workspace_field_helper" title "$(_cmux_cli_path)" "" "$CMUX_WORKSPACE_ID" 2>/dev/null)
+    if [ -n "$_cmux_title" ]; then
+      PROJECT="$_cmux_title"
+    fi
+  fi
+fi
+if [ -n "${MSG:-}" ] && [ -n "${PROJECT:-}" ]; then
+  NOTIFY_PROJECT="$PROJECT"
+  if [ "${NOTIFICATION_TITLE_IDE:-false}" = "true" ] && [ -n "${IDE_LABEL:-}" ]; then
+    NOTIFY_PROJECT="${PROJECT} - ${IDE_LABEL}"
+  fi
+fi
 
 # --- Bash-side debug log function for [play] and [notify] phases ---
 if [ -n "${_PEON_LOG_FILE:-}" ]; then
@@ -5013,9 +6319,15 @@ if [ "${PEON_EXIT:-true}" = "true" ]; then
   fi
   # Maintain tab title even on suppressed events (plan mode, unknown events, subagent start).
   # PROJECT is only emitted by paths that should maintain the title; agent/disabled paths omit it.
-  if [ -n "${PROJECT:-}" ] && [ "${EVENT:-}" != "SessionEnd" ]; then
-    { printf '\033]0;%s\007' "${NOTIF_MARKER-${MARKER}}${PROJECT}: ${STATUS:-working}" > /dev/tty; } 2>/dev/null || true
+  if [ "${TERMINAL_TAB_TITLE:-true}" = "true" ] && [ -n "${PROJECT:-}" ] && [ "${EVENT:-}" != "SessionEnd" ]; then
+    _peon_title="${NOTIF_MARKER-${MARKER}}${PROJECT}: ${STATUS:-working}"
+    [ "${PEON_TEST:-0}" = "1" ] && printf '%s\n' "$_peon_title" > "$PEON_DIR/.tab_title"
+    # Target the pane that owns this hook process, not the focused pane (issue #548).
+    _peon_early_tty="/dev/tty"
+    [ -n "${PEON_ENV_HOOK_TTY:-}" ] && [ -w "/dev/${PEON_ENV_HOOK_TTY}" ] && _peon_early_tty="/dev/${PEON_ENV_HOOK_TTY}"
+    { printf '\033]0;%s\007' "$_peon_title" > "$_peon_early_tty"; } 2>/dev/null || true
   fi
+  _cmux_update_status_async
   exit 0
 fi
 
@@ -5056,6 +6368,11 @@ fi
 IN_MEETING=false
 if [ "${MEETING_DETECT:-false}" = "true" ]; then
   detect_meeting && IN_MEETING=true
+fi
+
+IN_FOCUS=false
+if [ "${FOCUS_DETECT:-false}" = "true" ]; then
+  detect_focus && IN_FOCUS=true
 fi
 
 # Resolve session tty early so _run_sound_and_notify can check tab focus
@@ -5137,8 +6454,9 @@ if [ "$EVENT" = "SessionStart" ] && { [ "$PEON_PLATFORM" = "devcontainer" ] || [
   fi
 fi
 
-# --- Build tab title ---
+# --- Build notification title ---
 TITLE="${NOTIF_MARKER-${MARKER}}${PROJECT}: ${STATUS}"
+NOTIFY_TITLE="${NOTIFY_PROJECT:-$PROJECT}"
 
 # --- Resolve TTY for escape sequences ---
 # Write to /dev/tty so the escape sequence reaches the terminal directly.
@@ -5146,30 +6464,58 @@ TITLE="${NOTIF_MARKER-${MARKER}}${PROJECT}: ${STATUS}"
 # Inside tmux, /dev/tty may not be available from hook subprocesses;
 # fall back to the tmux pane's TTY in that case.
 _peon_tty=""
-if [ -n "${TMUX:-}" ]; then
+# Prefer the ancestor-walked session TTY: it identifies the pane that actually
+# owns this hook process. Inside tmux, `display-message` with no -t target
+# returns the *active/focused* pane's TTY, which is wrong when the user has
+# switched focus to another pane while the agent works (issue #548). Fall back
+# to tmux's pane lookup, then to /dev/tty.
+if [ -n "${PEON_ENV_HOOK_TTY:-}" ] && [ -w "/dev/${PEON_ENV_HOOK_TTY}" ]; then
+  _peon_tty="/dev/${PEON_ENV_HOOK_TTY}"
+elif [ -n "${TMUX:-}" ]; then
   _peon_tty=$(tmux display-message -p '#{pane_tty}' 2>/dev/null || true)
 fi
-[ -z "$_peon_tty" ] && _peon_tty="/dev/tty"
+if [ -z "$_peon_tty" ]; then
+  # Claude Code (and other agents) run hook commands without a controlling
+  # terminal, so /dev/tty is unavailable and escape writes silently fail.
+  _peon_tty="/dev/tty"
+fi
+# In test mode the real TTY isn't writable, so redirect escapes to a file the
+# BATS suite can read back to assert on what would (or would not) be emitted.
+[ "${PEON_TEST:-0}" = "1" ] && _peon_tty="$PEON_DIR/.osc_out"
 
-# Helper: emit an escape sequence, wrapping in DCS passthrough when inside tmux
-# so the host terminal (iTerm2, Ghostty, etc.) receives it through the tmux layer.
-# Requires tmux 3.3a+ with: set -g allow-passthrough on
+# Helper: emit a terminal escape sequence (tab title / tab color) to the session TTY.
+#
+# Inside tmux the escape only fires when tmux_passthrough is enabled (default off),
+# in which case it's wrapped in tmux's DCS passthrough so the host terminal (iTerm2,
+# Ghostty, etc.) receives it — requires tmux 3.3a+ with `set -g allow-passthrough on`.
+# Passthrough is off by default because a tmux client multiplexes many panes/windows
+# onto a SINGLE host terminal tab with no per-pane addressing: with multiple Claude
+# Code sessions, every hook — including from BACKGROUND panes — would stomp the one
+# visible tab on a last-writer-wins basis, so the tab reflects "most recent hook
+# anywhere", not any single session. Users with a 1-window-per-tab layout can opt back
+# in via "tmux_passthrough": true. Outside tmux (1 tab = 1 session) we always emit.
 _peon_esc() {
-  local seq="$1"
   if [ -n "${TMUX:-}" ]; then
-    { printf '\033Ptmux;\033%s\033\\' "$seq" > "$_peon_tty"; } 2>/dev/null || true
+    [ "${TMUX_PASSTHROUGH:-false}" = "true" ] || return 0
+    { printf '\033Ptmux;\033%s\033\\' "$1" > "$_peon_tty"; } 2>/dev/null || true
   else
-    { printf '%s' "$seq" > "$_peon_tty"; } 2>/dev/null || true
+    { printf '%s' "$1" > "$_peon_tty"; } 2>/dev/null || true
   fi
 }
 
 # --- Set tab title via ANSI escape (works in Warp, iTerm2, Terminal.app, etc.) ---
-if [ -n "$TITLE" ]; then
+if [ "${TERMINAL_TAB_TITLE:-true}" = "true" ] && [ -n "$TITLE" ]; then
+  [ "${PEON_TEST:-0}" = "1" ] && printf '%s\n' "$TITLE" > "$PEON_DIR/.tab_title"
   _peon_esc "$(printf '\033]0;%s\007' "$TITLE")"
 fi
 
+# --- Mirror the status into cmux's sidebar pill ---
+_cmux_update_status_async
+
 # --- Set iTerm2 tab color (OSC 6) ---
-# Detects iTerm2 via ITERM_SESSION_ID (persists inside tmux where TERM_PROGRAM=tmux).
+# Detects iTerm2 via ITERM_SESSION_ID (persists inside local tmux where TERM_PROGRAM=tmux)
+# or LC_TERMINAL=iTerm2, the only iTerm2 signal that survives SSH — forwarded via the
+# LC_* SendEnv whitelist — and tmux, where ITERM_SESSION_ID and TERM_PROGRAM are lost.
 # In test mode, write resolved values to files for BATS verification.
 if [ "$_PEON_SYNC" = "true" ]; then
   [ -n "$TAB_COLOR_RGB" ] && echo "$TAB_COLOR_RGB" > "$PEON_DIR/.tab_color_rgb"
@@ -5183,7 +6529,7 @@ if [ "$_PEON_SYNC" = "true" ]; then
   echo "${TTS_MODE:-}" > "$PEON_DIR/.tts_mode"
   echo "${TRAINER_TTS_TEXT:-}" > "$PEON_DIR/.trainer_tts_text"
 fi
-if [ -n "$TAB_COLOR_RGB" ] && { [[ "${TERM_PROGRAM:-}" == "iTerm.app" ]] || [ -n "${ITERM_SESSION_ID:-}" ]; }; then
+if [ -n "$TAB_COLOR_RGB" ] && { [[ "${TERM_PROGRAM:-}" == "iTerm.app" ]] || [ -n "${ITERM_SESSION_ID:-}" ] || [ "${LC_TERMINAL:-}" = "iTerm2" ]; }; then
   read -r _R _G _B <<< "$TAB_COLOR_RGB"
   _peon_esc "$(printf '\033]6;1;bg;red;brightness;%d\a' "$_R")"
   _peon_esc "$(printf '\033]6;1;bg;green;brightness;%d\a' "$_G")"
@@ -5220,6 +6566,12 @@ _run_sound_and_notify() {
   fi
   # Check meeting_detect: skip sound if in a meeting
   if [ "$_skip_sound" = "false" ] && [ "${MEETING_DETECT:-false}" = "true" ] && [ "${IN_MEETING:-false}" = "true" ]; then
+    _skip_sound=true
+  fi
+  # Check focus_detect: skip sound if a macOS Focus / Do Not Disturb mode is
+  # active and the suppression scope covers sound (mode 'all' or 'sound').
+  if [ "$_skip_sound" = "false" ] && [ "${FOCUS_DETECT:-false}" = "true" ] && [ "${IN_FOCUS:-false}" = "true" ] \
+     && { [ "${FOCUS_DETECT_MODE:-all}" = "all" ] || [ "${FOCUS_DETECT_MODE:-all}" = "sound" ]; }; then
     _skip_sound=true
   fi
   # Check suppress_sound_when_tab_focused: skip sound if tab is focused
@@ -5261,14 +6613,33 @@ _run_sound_and_notify() {
   fi
 
   # --- Smart notification: only when terminal is NOT frontmost ---
-  if [ -n "$NOTIFY" ] && [ "$PAUSED" != "true" ] && [ "${DESKTOP_NOTIF:-true}" = "true" ]; then
+  # Focus / Do Not Disturb also suppresses the overlay+notification, which
+  # otherwise bypasses Notification Center the same way the sound does, but
+  # only when the suppression scope covers notifications (mode 'all' or
+  # 'notifications').
+  local _focus_block=false
+  if [ "${FOCUS_DETECT:-false}" = "true" ] && [ "${IN_FOCUS:-false}" = "true" ] \
+     && { [ "${FOCUS_DETECT_MODE:-all}" = "all" ] || [ "${FOCUS_DETECT_MODE:-all}" = "notifications" ]; }; then
+    _focus_block=true
+  fi
+  if [ -n "$NOTIFY" ] && [ "$PAUSED" != "true" ] && [ "${DESKTOP_NOTIF:-true}" = "true" ] && [ "$_focus_block" = "false" ]; then
+    local _force_cmux_standard_notify=false
+    if [ "$PEON_PLATFORM" = "mac" ] && [ "${NOTIF_STYLE:-overlay}" = "standard" ] && _is_cmux_session; then
+      _force_cmux_standard_notify=true
+    fi
     [ -z "$_focused" ] && { terminal_is_focused && _focused=true || _focused=false; }
-    [ "$_focused" != "true" ] && send_notification "$MSG" "$TITLE" "${NOTIFY_COLOR:-red}" "${ICON_PATH:-}"
+    _peon_log notify "gate event=${EVENT:-} focused=$_focused paused=$PAUSED desktop=${DESKTOP_NOTIF:-true} style=${NOTIF_STYLE:-overlay} cmux_standard=$_force_cmux_standard_notify title=$(printf '%q' "$NOTIFY_TITLE") msg=$(printf '%q' "$MSG")"
+    if [ "$_focused" != "true" ] || [ "$_force_cmux_standard_notify" = "true" ]; then
+      _peon_log notify "dispatch event=${EVENT:-} focused=$_focused style=${NOTIF_STYLE:-overlay} cmux_standard=$_force_cmux_standard_notify"
+      send_notification "$MSG" "$NOTIFY_TITLE" "${NOTIFY_COLOR:-red}" "${ICON_PATH:-}"
+    else
+      _peon_log notify "suppressed event=${EVENT:-} focused=$_focused style=${NOTIF_STYLE:-overlay}"
+    fi
   fi
 
   # --- Mobile push notification (always sends when configured, regardless of focus) ---
   if [ -n "$NOTIFY" ] && [ "$PAUSED" != "true" ] && [ "${MOBILE_NOTIF:-false}" = "true" ]; then
-    send_mobile_notification "$MSG" "$TITLE" "${NOTIFY_COLOR:-red}"
+    send_mobile_notification "$MSG" "$NOTIFY_TITLE" "${NOTIFY_COLOR:-red}"
   fi
 }
 
@@ -5280,7 +6651,9 @@ else
 fi
 
 # --- Trainer reminder sound (after main sound finishes) ---
-if [ -n "${TRAINER_SOUND:-}" ] && [ -f "$TRAINER_SOUND" ]; then
+# Honor `peon pause` / mute: the trainer is a sound like any other, so it must
+# stay silent when PAUSED is set (mirrors the notification guards below). See #528.
+if [ -n "${TRAINER_SOUND:-}" ] && [ -f "$TRAINER_SOUND" ] && [ "$PAUSED" != "true" ]; then
   if [ "$_PEON_SYNC" = "true" ]; then
     play_sound "$TRAINER_SOUND" "$VOLUME"
     # Speak trainer TTS text after trainer sound when TTS enabled

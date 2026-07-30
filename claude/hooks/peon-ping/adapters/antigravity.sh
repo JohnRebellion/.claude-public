@@ -116,6 +116,7 @@ print(json.dumps({
     'cwd': os.environ['_PC'],
     'session_id': os.environ['_PS'],
     'permission_mode': '',
+    'source': 'antigravity',
 }))
 " | bash "$PEON_DIR/peon.sh" 2>/dev/null || true
 }

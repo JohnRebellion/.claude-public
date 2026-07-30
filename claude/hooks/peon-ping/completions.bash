@@ -15,7 +15,7 @@ _peon_completions() {
     case "$subcmd" in
       packs)
         if [ "$cword" -eq 2 ]; then
-          COMPREPLY=( $(compgen -W "list use next install install-local remove rotation bind unbind bindings community search" -- "$cur") )
+          COMPREPLY=( $(compgen -W "list use next install install-local remove rotation bind unbind bindings ide-bind ide-unbind ide-bindings exclude community search" -- "$cur") )
         elif [ "$cword" -eq 3 ] && [ "$prev" = "rotation" ]; then
           COMPREPLY=( $(compgen -W "list add remove clear" -- "$cur") )
         elif [ "$cword" -eq 4 ] && [ "${words[2]}" = "rotation" ] && { [ "$prev" = "add" ] || [ "$prev" = "remove" ]; }; then
@@ -38,6 +38,22 @@ _peon_completions() {
           COMPREPLY=( $(compgen -W "--registry" -- "$cur") )
         elif [ "$cword" -eq 4 ] && [ "${words[2]}" = "list" ] && [ "$prev" = "--registry" ]; then
           COMPREPLY=( $(compgen -W "--lang" -- "$cur") )
+        elif [ "$cword" -eq 3 ] && [ "$prev" = "ide-bind" ]; then
+          COMPREPLY=( $(compgen -W "claude codex cursor opencode kilo kiro gemini copilot windsurf kimi antigravity amp deepagents openclaw rovodev" -- "$cur") )
+        elif [ "$cword" -eq 3 ] && [ "$prev" = "ide-unbind" ]; then
+          COMPREPLY=( $(compgen -W "claude codex cursor opencode kilo kiro gemini copilot windsurf kimi antigravity amp deepagents openclaw rovodev" -- "$cur") )
+        elif [ "$cword" -eq 3 ] && [ "$prev" = "exclude" ]; then
+          COMPREPLY=( $(compgen -W "add remove list" -- "$cur") )
+        elif [ "$cword" -eq 4 ] && [ "${words[2]}" = "ide-bind" ]; then
+          packs_dir="${CLAUDE_PEON_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/peon-ping}/packs"
+          [ ! -d "$packs_dir" ] && [ -d "$HOME/.openpeon/packs" ] && packs_dir="$HOME/.openpeon/packs"
+          if [ -d "$packs_dir" ]; then
+            local names
+            names=$(find "$packs_dir" -maxdepth 2 \( -name manifest.json -o -name openpeon.json \) -exec dirname {} \; 2>/dev/null | xargs -I{} basename {} | sort)
+            COMPREPLY=( $(compgen -W "$names" -- "$cur") )
+          fi
+        elif [ "$cword" -eq 5 ] && [ "${words[2]}" = "ide-bind" ]; then
+          COMPREPLY=( $(compgen -W "--install" -- "$cur") )
         elif [ "$cword" -eq 3 ] && { [ "$prev" = "use" ] || [ "$prev" = "remove" ] || [ "$prev" = "bind" ]; }; then
           packs_dir="${CLAUDE_PEON_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/peon-ping}/packs"
           [ ! -d "$packs_dir" ] && [ -d "$HOME/.openpeon/packs" ] && packs_dir="$HOME/.openpeon/packs"
@@ -72,6 +88,11 @@ _peon_completions() {
           COMPREPLY=( $(compgen -W "ntfy pushover telegram on off status test" -- "$cur") )
         fi
         return 0 ;;
+      sounds)
+        if [ "$cword" -eq 2 ]; then
+          COMPREPLY=( $(compgen -W "list disable enable" -- "$cur") )
+        fi
+        return 0 ;;
       debug)
         if [ "$cword" -eq 2 ]; then
           COMPREPLY=( $(compgen -W "on off status" -- "$cur") )
@@ -98,7 +119,7 @@ _peon_completions() {
   fi
 
   # Top-level commands
-  COMPREPLY=( $(compgen -W "pause resume mute unmute toggle status volume rotation packs notifications mobile relay debug logs trainer update help" -- "$cur") )
+  COMPREPLY=( $(compgen -W "pause resume mute unmute toggle status volume rotation packs sounds notifications mobile relay debug logs trainer update help" -- "$cur") )
   return 0
 }
 

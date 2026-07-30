@@ -24,6 +24,22 @@ function run(argv) {
   var position    = argv[9] || 'top-center';
   var allScreens  = argv[11] === 'true';
   var screenIdx   = (argv[12] !== undefined && argv[12] !== '') ? parseInt(argv[12], 10) : -1;
+  var env = $.NSProcessInfo.processInfo.environment;
+  var clickCommandValue = env.objectForKey($('PEON_CLICK_COMMAND'));
+  var clickCommand = clickCommandValue && !clickCommandValue.isNil() ? ObjC.unwrap(clickCommandValue) : '';
+  var warpFocusUrlValue = env.objectForKey($('PEON_WARP_FOCUS_URL'));
+  var warpFocusUrl = warpFocusUrlValue && !warpFocusUrlValue.isNil() ? ObjC.unwrap(warpFocusUrlValue) : '';
+  if (warpFocusUrl.indexOf('warp://') !== 0) warpFocusUrl = '';
+  var cmuxFocusHelperValue = env.objectForKey($('PEON_CMUX_FOCUS_HELPER'));
+  var cmuxFocusCliValue = env.objectForKey($('PEON_CMUX_FOCUS_CLI'));
+  var cmuxFocusSocketValue = env.objectForKey($('PEON_CMUX_FOCUS_SOCKET'));
+  var cmuxFocusWorkspaceValue = env.objectForKey($('PEON_CMUX_FOCUS_WORKSPACE'));
+  var cmuxFocusSurfaceValue = env.objectForKey($('PEON_CMUX_FOCUS_SURFACE'));
+  var cmuxFocusHelper = cmuxFocusHelperValue && !cmuxFocusHelperValue.isNil() ? ObjC.unwrap(cmuxFocusHelperValue) : '';
+  var cmuxFocusCli = cmuxFocusCliValue && !cmuxFocusCliValue.isNil() ? ObjC.unwrap(cmuxFocusCliValue) : '';
+  var cmuxFocusSocket = cmuxFocusSocketValue && !cmuxFocusSocketValue.isNil() ? ObjC.unwrap(cmuxFocusSocketValue) : '';
+  var cmuxFocusWorkspace = cmuxFocusWorkspaceValue && !cmuxFocusWorkspaceValue.isNil() ? ObjC.unwrap(cmuxFocusWorkspaceValue) : '';
+  var cmuxFocusSurface = cmuxFocusSurfaceValue && !cmuxFocusSurfaceValue.isNil() ? ObjC.unwrap(cmuxFocusSurfaceValue) : '';
 
   // Color map
   var r = 180/255, g = 0, b = 0;
@@ -48,54 +64,95 @@ function run(argv) {
   // Register a click handler if we have a target bundle ID, IDE PID, or persistent mode
   var clickHandler = null;
   if (bundleId || idePid > 0 || persistent) {
+    function activateBundle(targetBundleId) {
+      if (!targetBundleId) return false;
+      var ws = $.NSWorkspace.sharedWorkspace;
+      var apps = ws.runningApplications;
+      var count = apps.count;
+      for (var i = 0; i < count; i++) {
+        var app = apps.objectAtIndex(i);
+        var bid = app.bundleIdentifier;
+        if (!bid.isNil() && bid.js === targetBundleId) {
+          app.activateWithOptions($.NSApplicationActivateIgnoringOtherApps);
+          return true;
+        }
+      }
+      return false;
+    }
+
+    function runClickCommand(command) {
+      if (!command) return false;
+      try {
+        var task = $.NSTask.alloc.init;
+        task.setLaunchPath($('/bin/bash'));
+        task.setArguments($(['-lc', command]));
+        task.launch;
+        task.waitUntilExit;
+        return task.terminationStatus === 0;
+      } catch(e) {
+        return false;
+      }
+    }
+
+    function runCmuxFocusTask() {
+      if (!cmuxFocusHelper || !cmuxFocusCli || !cmuxFocusSurface) return false;
+      try {
+        var args = [cmuxFocusCli];
+        if (cmuxFocusSocket) args.push(cmuxFocusSocket);
+        if (cmuxFocusWorkspace) args.push(cmuxFocusWorkspace);
+        args.push(cmuxFocusSurface);
+        var task = $.NSTask.alloc.init;
+        task.setLaunchPath($(cmuxFocusHelper));
+        task.setArguments($(args));
+        task.launch;
+        task.waitUntilExit;
+        return task.terminationStatus === 0;
+      } catch (e) {
+        return false;
+      }
+    }
+
     ObjC.registerSubclass({
       name: 'PeonClickHandler',
       superclass: 'NSObject',
       methods: {
-        'handleClick': {
-          types: ['void', []],
-          implementation: function() {
-            // iTerm2: raise the specific window containing our session
-            if (sessionTty && bundleId === 'com.googlecode.iterm2') {
-              var task = $.NSTask.alloc.init;
-              task.setLaunchPath($('/usr/bin/osascript'));
-              task.setArguments($(['-l', 'JavaScript', '-e',
-                'var iTerm=Application("iTerm2");var ws=iTerm.windows();var f=0;' +
-                'for(var w=0;w<ws.length&&!f;w++){var ts=ws[w].tabs();' +
-                'for(var t=0;t<ts.length&&!f;t++){var ss=ts[t].sessions();' +
-                'for(var s=0;s<ss.length&&!f;s++){try{if(ss[s].tty()==="' + sessionTty + '")' +
-                '{ts[t].select();ss[s].select();var wn=ws[w].name();' +
-                'var se=Application("System Events");var sw=se.processes["iTerm2"].windows();' +
-                'for(var i=0;i<sw.length;i++){try{if(sw[i].name()===wn){sw[i].actions["AXRaise"].perform();break}}catch(e2){}}' +
-                'ws[w].index=1;iTerm.activate();f=1}}catch(e){}}}}'
-              ]));
-              task.launch;
-              task.waitUntilExit;
-              // Signal ALL sibling overlays to dismiss (event-driven, no polling!)
+        'handleClick:': {
+          types: ['void', ['id']],
+          implementation: function(_sender) {
+            if (cmuxFocusHelper && cmuxFocusCli && cmuxFocusSurface) {
+              activateBundle(bundleId);
+              runCmuxFocusTask();
               $.NSDistributedNotificationCenter.defaultCenter.postNotificationNameObject($(dismissNotificationName), $.NSString.string);
-              // Small delay to ensure notification is delivered before we terminate
               $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(
                 0.05, $.NSApp, 'terminate:', null, false
               );
               return;
             }
+
+            // non-cmux: activate the terminal app, raise the tab hosting our
+            // session, THEN run any custom focus command (e.g. tmux
+            // select-window/select-pane) last — so tmux switches to the
+            // agent's pane after the correct terminal tab is already up.
             var activated = false;
-            // Primary: activate by bundle ID
-            var activated = false;
-            if (bundleId) {
-              var ws = $.NSWorkspace.sharedWorkspace;
-              var apps = ws.runningApplications;
-              var count = apps.count;
-              for (var i = 0; i < count; i++) {
-                var app = apps.objectAtIndex(i);
-                var bid = app.bundleIdentifier;
-                if (!bid.isNil() && bid.js === bundleId) {
-                  app.activateWithOptions($.NSApplicationActivateIgnoringOtherApps);
-                  activated = true;
-                  break;
-                }
+            // Warp: activateWithOptions() won't cross Spaces from this
+            // accessory-policy process; Warp's deep link does, and also selects
+            // the exact tab. Fall back to AppleScript activate (app + Space, no
+            // tab) on older Warp. Don't return, so a custom click command (tmux)
+            // still runs last, same as every other terminal.
+            if (bundleId === 'dev.warp.Warp-Stable') {
+              var warpTask = $.NSTask.alloc.init;
+              if (warpFocusUrl) {
+                warpTask.setLaunchPath($('/usr/bin/open'));
+                warpTask.setArguments($([warpFocusUrl]));
+              } else {
+                warpTask.setLaunchPath($('/usr/bin/osascript'));
+                warpTask.setArguments($(['-e', 'tell application "Warp" to activate']));
               }
+              warpTask.launch;
+              warpTask.waitUntilExit;
+              activated = true;
             }
+            if (!activated && bundleId) activated = activateBundle(bundleId);
             // Fallback: activate by IDE PID (for embedded terminals)
             if (!activated && idePid > 0) {
               var ideApp = $.NSRunningApplication.runningApplicationWithProcessIdentifier(idePid);
@@ -103,23 +160,30 @@ function run(argv) {
                 ideApp.activateWithOptions($.NSApplicationActivateIgnoringOtherApps);
               }
             }
-            // iTerm2: try tab/window-level focus after app activation (fire-and-forget)
+            // iTerm2: raise the specific window/tab hosting our session (by tty)
             if (sessionTty && bundleId === 'com.googlecode.iterm2') {
               try {
-                var task = $.NSTask.alloc.init;
-                task.setLaunchPath($('/usr/bin/osascript'));
-                task.setArguments($(['-l', 'JavaScript', '-e',
+                var itask = $.NSTask.alloc.init;
+                itask.setLaunchPath($('/usr/bin/osascript'));
+                itask.setArguments($(['-l', 'JavaScript', '-e',
                   'var iTerm=Application("iTerm2");var ws=iTerm.windows();var f=0;' +
                   'for(var w=0;w<ws.length&&!f;w++){var ts=ws[w].tabs();' +
                   'for(var t=0;t<ts.length&&!f;t++){var ss=ts[t].sessions();' +
                   'for(var s=0;s<ss.length&&!f;s++){try{if(ss[s].tty()==="' + sessionTty + '")' +
-                  '{ts[t].select();ss[s].select();ws[w].index=1;f=1}}catch(e){}}}}'
+                  '{ts[t].select();ss[s].select();var wn=ws[w].name();' +
+                  'var se=Application("System Events");var sw=se.processes["iTerm2"].windows();' +
+                  'for(var i=0;i<sw.length;i++){try{if(sw[i].name()===wn){sw[i].actions["AXRaise"].perform();break}}catch(e2){}}' +
+                  'ws[w].index=1;iTerm.activate();f=1}}catch(e){}}}}'
                 ]));
-                task.launch;
+                itask.launch;
+                itask.waitUntilExit;
               } catch(e) {}
             }
+            // Custom focus command — e.g. `tmux select-window/select-pane` to
+            // jump to the agent's OWN pane, which app/tab focus can't reach.
+            if (clickCommand) runClickCommand(clickCommand);
 
-            // Signal ALL sibling overlays to dismiss
+            // Signal ALL sibling overlays to dismiss (event-driven, no polling)
             $.NSDistributedNotificationCenter.defaultCenter.postNotificationNameObject($(dismissNotificationName), $.NSString.string);
             // Small delay to ensure notification is delivered before we terminate
             $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(
@@ -236,12 +300,40 @@ function run(argv) {
       }
     }
 
-    // Message label — vertically centered
-    var font = $.NSFont.boldSystemFontOfSize(16);
-    var textHeight = font.ascender - font.descender + font.leading + 4;
-    var textY = (winHeight - textHeight) / 2;
+    // Message label(s). When a subtitle is supplied (argv[8]), stack the
+    // title on top and the subtitle below; otherwise render a single,
+    // vertically-centered line (original behavior).
+    var hasSubtitle = subtitle && subtitle.length > 0;
+    var titleFont = $.NSFont.boldSystemFontOfSize(16);
+    var titleHeight = titleFont.ascender - titleFont.descender + titleFont.leading + 4;
+
+    var titleY;
+    if (hasSubtitle) {
+      var subFont = $.NSFont.systemFontOfSize(12);
+      var subHeight = subFont.ascender - subFont.descender + subFont.leading + 4;
+      var gap = 2;
+      var blockBottom = (winHeight - (titleHeight + gap + subHeight)) / 2;
+      titleY = blockBottom + subHeight + gap; // title above subtitle
+      var subLabel = $.NSTextField.alloc.initWithFrame(
+        $.NSMakeRect(textX, blockBottom, textWidth, subHeight)
+      );
+      subLabel.setStringValue($(subtitle));
+      subLabel.setBezeled(false);
+      subLabel.setDrawsBackground(false);
+      subLabel.setEditable(false);
+      subLabel.setSelectable(false);
+      subLabel.setTextColor($.NSColor.colorWithSRGBRedGreenBlueAlpha(1, 1, 1, 0.85));
+      subLabel.setAlignment($.NSTextAlignmentCenter);
+      subLabel.setFont(subFont);
+      subLabel.setLineBreakMode($.NSLineBreakByTruncatingTail);
+      subLabel.cell.setWraps(false);
+      contentView.addSubview(subLabel);
+    } else {
+      titleY = (winHeight - titleHeight) / 2;
+    }
+
     var label = $.NSTextField.alloc.initWithFrame(
-      $.NSMakeRect(textX, textY, textWidth, textHeight)
+      $.NSMakeRect(textX, titleY, textWidth, titleHeight)
     );
     label.setStringValue($(message));
     label.setBezeled(false);
@@ -250,7 +342,7 @@ function run(argv) {
     label.setSelectable(false);
     label.setTextColor($.NSColor.whiteColor);
     label.setAlignment($.NSTextAlignmentCenter);
-    label.setFont(font);
+    label.setFont(titleFont);
     label.setLineBreakMode($.NSLineBreakByTruncatingTail);
     label.cell.setWraps(false);
     contentView.addSubview(label);
@@ -278,7 +370,7 @@ function run(argv) {
       btn.setBordered(false);
       btn.setTransparent(true);
       btn.setTarget(clickHandler);
-      btn.setAction('handleClick');
+      btn.setAction('handleClick:');
       contentView.addSubview(btn);
     }
 

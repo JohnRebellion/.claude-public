@@ -120,22 +120,24 @@ if [ ! -d "$PEON_DIR/packs" ]; then
   exit 1
 fi
 
-# --- Detect host platform ---
-case "$(uname -s)" in
-  Darwin) HOST_PLATFORM="mac" ;;
-  Linux)
-    # Check for Docker/devcontainer BEFORE checking for WSL
-    # (devcontainers on WSL2 have both indicators)
-    if [ -f /.dockerenv ]; then
-      HOST_PLATFORM="linux"
-    elif grep -qi microsoft /proc/version 2>/dev/null; then
-      HOST_PLATFORM="wsl"
-    else
-      HOST_PLATFORM="linux"
-    fi ;;
-  MINGW*|MSYS*|CYGWIN*) HOST_PLATFORM="windows" ;;
-  *)      HOST_PLATFORM="unknown" ;;
-esac
+# --- Detect host platform (override-friendly for tests) ---
+if [ -z "${HOST_PLATFORM:-}" ]; then
+  case "$(uname -s)" in
+    Darwin) HOST_PLATFORM="mac" ;;
+    Linux)
+      # Check for Docker/devcontainer BEFORE checking for WSL
+      # (devcontainers on WSL2 have both indicators)
+      if [ -f /.dockerenv ]; then
+        HOST_PLATFORM="linux"
+      elif grep -qi microsoft /proc/version 2>/dev/null; then
+        HOST_PLATFORM="wsl"
+      else
+        HOST_PLATFORM="linux"
+      fi ;;
+    MINGW*|MSYS*|CYGWIN*) HOST_PLATFORM="windows" ;;
+    *)      HOST_PLATFORM="unknown" ;;
+  esac
+fi
 
 export RELAY_PORT PEON_DIR BIND_ADDR HOST_PLATFORM
 
@@ -190,6 +192,7 @@ PORT = int(sys.argv[4])
 CONFIG_FILE = os.path.join(PEON_DIR, "config.json")
 STATE_FILE = os.path.join(PEON_DIR, ".state.json")
 REMOTE_STATE_FILE = os.path.join(PEON_DIR, ".remote_state.json")
+PAUSED_FILE = os.path.join(PEON_DIR, ".paused")
 
 active_sessions = {}  # session_id → time.time() when UserPromptSubmit received
 SESSION_KEEPALIVE_S = 600  # safety timeout
@@ -281,6 +284,13 @@ def pick_sound_for_category(category):
     if not sounds:
         return None, None
 
+    # Filter out individually disabled sounds (by basename)
+    disabled_list = config.get("disabled_sounds", {}).get(active_pack, {}).get(category, []) or []
+    if disabled_list:
+        sounds = [s for s in sounds if os.path.basename(str(s.get("file", ""))) not in disabled_list]
+        if not sounds:
+            return None, None
+
     # Load state to avoid repeats
     state = load_state()
     last_played = state.get("last_played", {})
@@ -333,7 +343,7 @@ def play_sound_on_host(path, volume):
     elif HOST_PLATFORM == "linux":
         # Try players in priority order (same as peon.sh)
         players = [
-            (["pw-play", "--volume", vol, path], "pw-play"),
+            (["pw-play", "--media-role=Notification", "--volume", vol, path], "pw-play"),
             (["paplay", f"--volume={max(0, min(65536, int(float(vol) * 65536)))}", path], "paplay"),
             (["ffplay", "-nodisp", "-autoexit", "-volume", str(max(0, min(100, int(float(vol) * 100)))), path], "ffplay"),
             (["mpv", "--no-video", f"--volume={max(0, min(100, int(float(vol) * 100)))}", path], "mpv"),
@@ -462,6 +472,17 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
 
         if parsed.path != "/play":
             self.send_error(404)
+            return
+
+        # Honor `peon pause`: when the .paused flag is set, the relay daemon
+        # stays silent too (peon.sh writes this file on `peon pause`). Without
+        # this check, remote sessions kept playing sounds after pause (#521).
+        # Acknowledge with 200 so the caller doesn't treat it as an error.
+        if os.path.exists(PAUSED_FILE):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK: paused")
             return
 
         params = urllib.parse.parse_qs(parsed.query)

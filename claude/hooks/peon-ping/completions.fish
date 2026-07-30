@@ -32,6 +32,7 @@ complete -c peon -n "__peon_using_subcommand status" -l verbose -d "Show full de
 complete -c peon -n __peon_no_subcommand -a volume -d "Get or set volume level"
 complete -c peon -n __peon_no_subcommand -a rotation -d "Get or set pack rotation mode"
 complete -c peon -n __peon_no_subcommand -a packs -d "Manage sound packs"
+complete -c peon -n __peon_no_subcommand -a sounds -d "Enable/disable individual sounds in a pack"
 complete -c peon -n __peon_no_subcommand -a notifications -d "Control desktop notifications"
 complete -c peon -n __peon_no_subcommand -a mobile -d "Configure mobile push notifications"
 complete -c peon -n __peon_no_subcommand -a debug -d "Toggle debug logging"
@@ -52,6 +53,10 @@ complete -c peon -n "__peon_using_subcommand packs" -a rotation -d "Manage pack 
 complete -c peon -n "__peon_using_subcommand packs" -a bind -d "Bind a pack to the current directory"
 complete -c peon -n "__peon_using_subcommand packs" -a unbind -d "Remove pack binding for current directory"
 complete -c peon -n "__peon_using_subcommand packs" -a bindings -d "List all directory-to-pack bindings"
+complete -c peon -n "__peon_using_subcommand packs" -a ide-bind -d "Bind a pack to an IDE id"
+complete -c peon -n "__peon_using_subcommand packs" -a ide-unbind -d "Remove an IDE binding"
+complete -c peon -n "__peon_using_subcommand packs" -a ide-bindings -d "List all IDE-to-pack bindings"
+complete -c peon -n "__peon_using_subcommand packs" -a exclude -d "Manage path exclusions for path_rules"
 complete -c peon -n "__peon_using_subcommand packs" -a community -d "List all packs from registry"
 complete -c peon -n "__peon_using_subcommand packs" -a search -d "Search registry packs by name"
 
@@ -99,6 +104,21 @@ complete -c peon -n "__peon_packs_subcommand bind" -a "(
     end
   end
 )"
+complete -c peon -n "__peon_packs_subcommand ide-bind" -a "claude codex cursor opencode kilo kiro gemini copilot windsurf kimi antigravity amp deepagents openclaw rovodev"
+complete -c peon -n "__peon_packs_subcommand ide-unbind" -a "claude codex cursor opencode kilo kiro gemini copilot windsurf kimi antigravity amp deepagents openclaw rovodev"
+complete -c peon -n "__peon_packs_subcommand ide-bind; and test (count (commandline -opc)) -eq 4" -a "(
+  set -l packs_dir (set -q CLAUDE_PEON_DIR; and echo \$CLAUDE_PEON_DIR; or echo \$HOME/.claude/hooks/peon-ping)/packs
+  if not test -d \$packs_dir; and test -d \$HOME/.openpeon/packs
+    set packs_dir \$HOME/.openpeon/packs
+  end
+  if test -d \$packs_dir
+    for manifest in \$packs_dir/*/manifest.json \$packs_dir/*/openpeon.json
+      basename (dirname \$manifest)
+    end
+  end
+)"
+complete -c peon -n "__peon_packs_subcommand ide-bind; and test (count (commandline -opc)) -eq 5" -a "--install" -d "Install from registry if needed"
+complete -c peon -n "__peon_packs_subcommand exclude" -a "add remove list"
 complete -c peon -n "__peon_packs_subcommand remove" -a "(
   set -l packs_dir (set -q CLAUDE_PEON_DIR; and echo \$CLAUDE_PEON_DIR; or echo \$HOME/.claude/hooks/peon-ping)/packs
   if not test -d \$packs_dir; and test -d \$HOME/.openpeon/packs
@@ -180,6 +200,11 @@ function __peon_trainer_goal
   set -l cmd (commandline -opc)
   test (count $cmd) -ge 3; and test $cmd[2] = trainer; and test $cmd[3] = goal
 end
+
+# sounds subcommands
+complete -c peon -n "__peon_using_subcommand sounds" -a list -d "List sounds in a pack"
+complete -c peon -n "__peon_using_subcommand sounds" -a disable -d "Disable an individual sound"
+complete -c peon -n "__peon_using_subcommand sounds" -a enable -d "Re-enable an individual sound"
 
 # trainer goal weekday completions (short names)
 complete -c peon -n __peon_trainer_goal -a mon -d "Monday"

@@ -10,6 +10,8 @@
 #   PEON_SYNC           1 = synchronous (for tests), 0 = async (default)
 #   PEON_BUNDLE_ID      macOS terminal bundle ID for click-to-focus (empty = skip)
 #   PEON_IDE_PID        macOS IDE ancestor PID for click-to-focus (empty = skip)
+#   PEON_CMUX_*         cmux workspace/surface/socket/CLI for exact click-to-focus
+#   PEON_SESSION_TTY    session tty for iTerm2 exact tab/window click-to-focus
 #   PEON_NOTIF_POSITION notification position: top-center|top-right|top-left|bottom-right|bottom-left|bottom-center
 #   PEON_NOTIF_DISMISS  dismiss time in seconds (0 = persistent until clicked)
 #   TERM_PROGRAM        Terminal emulator name (for iTerm2/Kitty escape sequences)
@@ -17,12 +19,27 @@ set -uo pipefail
 
 msg="${1:-}" title="${2:-}" color="${3:-red}" icon_path="${4:-}"
 
-[ -z "$msg" ] && exit 0
+[ -z "$msg" ] && [ -z "$title" ] && exit 0
 
 # --- Resolve PEON_DIR ---
 if [ -z "${PEON_DIR:-}" ]; then
   PEON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
+
+_notify_debug() {
+  [ "${PEON_DEBUG:-0}" = "1" ] || return 0
+  [ -n "${PEON_DIR:-}" ] || return 0
+  local log_dir log_file ts
+  log_dir="$PEON_DIR/logs"
+  mkdir -p "$log_dir" 2>/dev/null || return 0
+  log_file="$log_dir/peon-ping-$(date +%Y-%m-%d).log"
+  if date '+%Y-%m-%dT%H:%M:%S.%3N' 2>/dev/null | grep -qE '\.[0-9]{3}$'; then
+    ts=$(date '+%Y-%m-%dT%H:%M:%S.%3N')
+  else
+    ts=$(python3 -c "import datetime as d;n=d.datetime.now();print(n.strftime('%Y-%m-%dT%H:%M:%S.')+f'{n.microsecond//1000:03d}')" 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S.000')
+  fi
+  printf '%s [notify] %s\n' "$ts" "$*" >> "$log_file" 2>/dev/null || true
+}
 
 # --- Resolve platform ---
 if [ -z "${PEON_PLATFORM:-}" ]; then
@@ -92,6 +109,111 @@ _find_overlay() {
   p="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mac-overlay.js"
   [ -f "$p" ] && { echo "$p"; return 0; }
   return 1
+}
+
+_find_cmux_focus_helper() {
+  local p="$PEON_DIR/scripts/cmux-focus.sh"
+  [ -f "$p" ] && { echo "$p"; return 0; }
+  p="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cmux-focus.sh"
+  [ -f "$p" ] && { echo "$p"; return 0; }
+  return 1
+}
+
+_find_cmux_workspace_field_helper() {
+  local p="$PEON_DIR/scripts/cmux-workspace-field.sh"
+  [ -f "$p" ] && { echo "$p"; return 0; }
+  p="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cmux-workspace-field.sh"
+  [ -f "$p" ] && { echo "$p"; return 0; }
+  return 1
+}
+
+_cmux_click_command() {
+  local cmux_focus_helper="$1"
+  local cmux_cli="$2"
+  local cmux_socket_path="$3"
+  local cmux_workspace_id="$4"
+  local cmux_surface_id="$5"
+  local click_args click_command
+
+  [ -n "$cmux_focus_helper" ] || return 1
+  [ -n "$cmux_cli" ] || return 1
+  [ -n "$cmux_surface_id" ] || return 1
+
+  click_args=("$cmux_focus_helper" "$cmux_cli" "$cmux_socket_path" "$cmux_workspace_id" "$cmux_surface_id")
+  printf -v click_command '%q ' "${click_args[@]}"
+  printf '%s\n' "${click_command% }"
+}
+
+# Build a click command that focuses the exact window the session lives in,
+# rather than just activating the app (with several windows open, -activate
+# lands on whichever was focused last, not the one that pinged). Used when no
+# cmux target or explicit PEON_CLICK_COMMAND is set.
+#   iTerm2:         select the tab/session whose tty matches PEON_SESSION_TTY
+#                   (same approach as the overlay's session focus)
+#   VS Code family: `open -b <bundle> <workspace dir>` raises the window that
+#                   has the workspace open. VS Code, Cursor, and Windsurf all
+#                   set TERM_PROGRAM=vscode; the caller has already resolved
+#                   the running IDE's bundle id. Uses the git toplevel as the
+#                   workspace dir (the hook cwd may be a subdirectory, which
+#                   would open a new window instead of focusing the existing
+#                   one), falling back to the cwd outside a repo.
+_terminal_focus_click_command() {
+  local bundle_id="$1"
+  local session_tty="$2"
+  local focus_dir jxa
+
+  if [ "$bundle_id" = "com.googlecode.iterm2" ] && [ -n "$session_tty" ]; then
+    jxa='function run(argv){var tty=argv[0];var iTerm=Application("iTerm2");var ws=iTerm.windows();'
+    jxa+='for(var w=0;w<ws.length;w++){var ts=ws[w].tabs();'
+    jxa+='for(var t=0;t<ts.length;t++){var ss=ts[t].sessions();'
+    jxa+='for(var s=0;s<ss.length;s++){try{if(ss[s].tty()===tty)'
+    jxa+='{ts[t].select();ss[s].select();ws[w].index=1;iTerm.activate();return}}catch(e){}}}}'
+    jxa+='iTerm.activate()}'
+    printf '/usr/bin/osascript -l JavaScript -e %q %q' "$jxa" "$session_tty"
+    return 0
+  fi
+
+  if [ "${TERM_PROGRAM:-}" = "vscode" ] && [ -n "$bundle_id" ]; then
+    focus_dir="$(git rev-parse --show-toplevel 2>/dev/null)" || focus_dir=""
+    [ -n "$focus_dir" ] || focus_dir="$PWD"
+    [ -d "$focus_dir" ] || return 1
+    printf '/usr/bin/open -b %q %q' "$bundle_id" "$focus_dir"
+    return 0
+  fi
+
+  return 1
+}
+
+_cmux_notify() {
+  local cmux_cli="$1"
+  local cmux_workspace_id="$2"
+  local cmux_surface_id="$3"
+  local title="$4"
+  local subtitle="$5"
+  local body="$6"
+  local -a cmux_args=()
+
+  [ -n "$cmux_cli" ] || return 1
+
+  cmux_args+=(notify --title "$title")
+  [ -n "$subtitle" ] && cmux_args+=(--subtitle "$subtitle")
+  [ -n "$body" ] && cmux_args+=(--body "$body")
+  [ -n "$cmux_workspace_id" ] && cmux_args+=(--workspace "$cmux_workspace_id")
+  [ -n "$cmux_surface_id" ] && cmux_args+=(--surface "$cmux_surface_id")
+
+  "$cmux_cli" "${cmux_args[@]}" >/dev/null 2>&1
+}
+
+_cmux_workspace_title() {
+  local cmux_cli="$1"
+  local cmux_workspace_id="$2"
+  local workspace_field_helper
+
+  [ -n "$cmux_cli" ] || return 1
+  [ -n "$cmux_workspace_id" ] || return 1
+
+  workspace_field_helper="$(_find_cmux_workspace_field_helper)" 2>/dev/null || return 1
+  "$workspace_field_helper" title "$cmux_cli" "" "$cmux_workspace_id" 2>/dev/null
 }
 
 # --- Resolve pack icon from active pack's openpeon.json ---
@@ -167,15 +289,54 @@ fi
 # ── Platform dispatch ────────────────────────────────────────────────────────
 case "$PEON_PLATFORM" in
   mac)
+    _notify_debug "dispatch style=${PEON_NOTIF_STYLE:-overlay} title=$(printf '%q' "$title") msg=$(printf '%q' "$msg")"
     overlay_script=""
     [ "${PEON_NOTIF_STYLE:-overlay}" = "overlay" ] && \
       overlay_script="$(_find_overlay)" 2>/dev/null || true
     bundle_id="${PEON_BUNDLE_ID:-}"
     ide_pid="${PEON_IDE_PID:-}"
+    warp_focus_url="${PEON_WARP_FOCUS_URL:-}"
+    cmux_workspace_id="${PEON_CMUX_WORKSPACE_ID:-}"
+    cmux_surface_id="${PEON_CMUX_SURFACE_ID:-}"
+    cmux_socket_path="${PEON_CMUX_SOCKET_PATH:-}"
+    cmux_cli="${PEON_CMUX_CLI:-}"
+    cmux_target_ready=false
+    [ -n "$cmux_cli" ] && [ -n "$cmux_workspace_id" ] && [ -n "$cmux_surface_id" ] && cmux_target_ready=true
+    click_command="${PEON_CLICK_COMMAND:-}"
+    cmux_focus_helper="$(_find_cmux_focus_helper)" 2>/dev/null || true
+    if [ -z "$click_command" ]; then
+      click_command="$(_cmux_click_command "$cmux_focus_helper" "$cmux_cli" "$cmux_socket_path" "$cmux_workspace_id" "$cmux_surface_id")" || true
+    fi
+    # Inside tmux, clicking the overlay must also switch tmux to the agent's own
+    # window/pane — activating the terminal app alone lands on whatever tmux
+    # window was last active. Build a focus command (explicit -S socket so it
+    # works from the overlay's detached env) targeting this agent's pane. Tried
+    # before the generic terminal-window focus below, since the overlay already
+    # raises the hosting terminal window natively and the pane switch is the
+    # part that only tmux can do.
+    if [ -z "$click_command" ] && [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1; then
+      _pp_tsock=$(printf '%q' "${TMUX%%,*}")
+      _pp_tpane=$(printf '%q' "$TMUX_PANE")
+      click_command="tmux -S $_pp_tsock switch-client -t $_pp_tpane 2>/dev/null; tmux -S $_pp_tsock select-window -t $_pp_tpane 2>/dev/null; tmux -S $_pp_tsock select-pane -t $_pp_tpane 2>/dev/null"
+    fi
+    if [ -z "$click_command" ]; then
+      click_command="$(_terminal_focus_click_command "$bundle_id" "${PEON_SESSION_TTY:-}")" || true
+      # The overlay focuses iTerm2 sessions natively but cannot derive an IDE
+      # window target itself; hand it the command via the env passthrough it
+      # already honors.
+      if [ -n "$click_command" ] && [ -z "${PEON_CLICK_COMMAND:-}" ] && [ "$bundle_id" != "com.googlecode.iterm2" ]; then
+        export PEON_CLICK_COMMAND="$click_command"
+      fi
+    fi
+    _notify_debug "mac overlay_script=$(printf '%q' "$overlay_script") bundle=$(printf '%q' "$bundle_id") click_command=$(printf '%q' "$click_command") workspace=$(printf '%q' "$cmux_workspace_id") surface=$(printf '%q' "$cmux_surface_id")"
     if [ -n "$overlay_script" ]; then
       # JXA Cocoa overlay — large, visible banner on all screens
       local_icon_arg=""
       [ -f "$icon_path" ] && local_icon_arg="$icon_path"
+      overlay_msg="$msg"
+      if [ "$cmux_target_ready" = "true" ] && [ -n "$title" ]; then
+        overlay_msg="$title"
+      fi
       _run_overlay() (
         # Kill stale overlay processes from prior invocations (older than 30s)
         # This prevents accumulation if NSTimer or watchdog failed to terminate them
@@ -240,8 +401,18 @@ case "$PEON_PLATFORM" in
           fi
         fi
 
+        # Prepend count badge if stacked
+        if [ "$count" -gt 1 ]; then
+          msg="($count) $msg"
+        fi
+
         local session_tty="${PEON_SESSION_TTY:-}"
+        local overlay_msg="$msg"
         local subtitle="${PEON_MSG_SUBTITLE:-}"
+        if [ -n "$title" ]; then
+          overlay_msg="$title"
+          [ -n "$msg" ] && [ -z "$subtitle" ] && subtitle="$msg"
+        fi
         local dismiss_secs="${PEON_NOTIF_DISMISS:-4}"
         local notif_position="${PEON_NOTIF_POSITION:-top-center}"
         local notify_type="${PEON_NOTIFY_TYPE:-}"
@@ -250,7 +421,7 @@ case "$PEON_PLATFORM" in
 
         # Prepend count badge if stacked
         if [ "$count" -gt 1 ]; then
-          msg="($count) $msg"
+          overlay_msg="($count) $overlay_msg"
         fi
 
         # argv[5]=bundle_id, argv[6]=ide_pid, argv[7]=session_tty, argv[8]=subtitle, argv[9]=position, argv[10]=notify_type, argv[11]=all_screens, argv[12]=screen_index, argv[13]=close_button
@@ -265,12 +436,29 @@ case "$PEON_PLATFORM" in
           if ! [[ "$screen_count" =~ ^[0-9]+$ ]] || [ "$screen_count" -lt 1 ]; then
             screen_count=1
           fi
+          _notify_debug "overlay spawn mode=all-screens count=$screen_count dismiss=$dismiss_secs script=$(printf '%q' "$overlay_script")"
           for _si in $(seq 0 $((screen_count - 1))); do
-            osascript -l JavaScript "$overlay_script" "$msg" "$color" "$local_icon_arg" "$slot" "$dismiss_secs" "$bundle_id" "$ide_pid" "$session_tty" "$subtitle" "$notif_position" "$notify_type" "$all_screens" "$_si" "$close_button" >/dev/null 2>&1 &
+            _notify_debug "overlay spawn screen=$_si"
+            PEON_CLICK_COMMAND="$click_command" \
+            PEON_WARP_FOCUS_URL="$warp_focus_url" \
+            PEON_CMUX_FOCUS_HELPER="$cmux_focus_helper" \
+            PEON_CMUX_FOCUS_CLI="$cmux_cli" \
+            PEON_CMUX_FOCUS_SOCKET="$cmux_socket_path" \
+            PEON_CMUX_FOCUS_WORKSPACE="$cmux_workspace_id" \
+            PEON_CMUX_FOCUS_SURFACE="$cmux_surface_id" \
+            nohup osascript -l JavaScript "$overlay_script" "$overlay_msg" "$color" "$local_icon_arg" "$slot" "$dismiss_secs" "$bundle_id" "$ide_pid" "$session_tty" "$subtitle" "$notif_position" "$notify_type" "$all_screens" "$_si" "$close_button" >/dev/null 2>&1 &
             _overlay_pids="$_overlay_pids $!"
           done
         else
-          osascript -l JavaScript "$overlay_script" "$msg" "$color" "$local_icon_arg" "$slot" "$dismiss_secs" "$bundle_id" "$ide_pid" "$session_tty" "$subtitle" "$notif_position" "$notify_type" "$all_screens" "" "$close_button" >/dev/null 2>&1 &
+          _notify_debug "overlay spawn mode=single dismiss=$dismiss_secs script=$(printf '%q' "$overlay_script")"
+          PEON_CLICK_COMMAND="$click_command" \
+          PEON_WARP_FOCUS_URL="$warp_focus_url" \
+          PEON_CMUX_FOCUS_HELPER="$cmux_focus_helper" \
+          PEON_CMUX_FOCUS_CLI="$cmux_cli" \
+          PEON_CMUX_FOCUS_SOCKET="$cmux_socket_path" \
+          PEON_CMUX_FOCUS_WORKSPACE="$cmux_workspace_id" \
+          PEON_CMUX_FOCUS_SURFACE="$cmux_surface_id" \
+          nohup osascript -l JavaScript "$overlay_script" "$overlay_msg" "$color" "$local_icon_arg" "$slot" "$dismiss_secs" "$bundle_id" "$ide_pid" "$session_tty" "$subtitle" "$notif_position" "$notify_type" "$all_screens" "" "$close_button" >/dev/null 2>&1 &
           _overlay_pids="$!"
         fi
         # Save session state for stacking
@@ -318,53 +506,43 @@ case "$PEON_PLATFORM" in
           printf '\e]99;i=peon:d=0;%s\e\\' "$title: $msg" > /dev/tty 2>/dev/null || true
           ;;
         *)
-          # Native macOS Notification Center (grouped by session, rich subtitle)
           notif_subtitle="${PEON_MSG_SUBTITLE:-}"
-          notif_group="peon-ping-${PEON_SESSION_ID:-default}"
-          if command -v terminal-notifier &>/dev/null; then
-            tn_icon_flag=""
-            [ -f "$icon_path" ] && tn_icon_flag="-appIcon $icon_path"
-            tn_activate_flag=""
-            [ -n "$bundle_id" ] && tn_activate_flag="-activate $bundle_id"
-            tn_subtitle_flag=""
-            [ -n "$notif_subtitle" ] && tn_subtitle_flag="-subtitle $notif_subtitle"
-            # -group makes consecutive notifications from the same session replace each other in Notification Center
+          if [ "$cmux_target_ready" = "true" ]; then
             if [ "$use_bg" = true ]; then
-              # shellcheck disable=SC2086
-              nohup terminal-notifier \
-                -title "$title" \
-                -message "$msg" \
-                $tn_subtitle_flag \
-                $tn_icon_flag \
-                $tn_activate_flag \
-                -group "$notif_group" >/dev/null 2>&1 &
+              cmux_notify_args=()
+              cmux_notify_args+=(notify --title "$title")
+              [ -n "$notif_subtitle" ] && cmux_notify_args+=(--subtitle "$notif_subtitle")
+              cmux_notify_args+=(--body "$msg" --workspace "$cmux_workspace_id" --surface "$cmux_surface_id")
+              nohup "$cmux_cli" "${cmux_notify_args[@]}" >/dev/null 2>&1 &
             else
-              # shellcheck disable=SC2086
-              terminal-notifier \
-                -title "$title" \
-                -message "$msg" \
-                $tn_subtitle_flag \
-                $tn_icon_flag \
-                $tn_activate_flag \
-                -group "$notif_group" >/dev/null 2>&1
+              _cmux_notify "$cmux_cli" "$cmux_workspace_id" "$cmux_surface_id" "$title" "$notif_subtitle" "$msg" || true
             fi
           else
-            # Fallback: osascript `display notification` — supports subtitle since 10.9
-            if [ "$use_bg" = true ]; then
-              nohup osascript - "$msg" "$title" "$notif_subtitle" >/dev/null 2>&1 <<'APPLESCRIPT' &
-on run argv
-  set msg to item 1 of argv
-  set tit to item 2 of argv
-  set sub to item 3 of argv
-  if sub is "" then
-    display notification msg with title tit
-  else
-    display notification msg with title tit subtitle sub
-  end if
-end run
-APPLESCRIPT
+            # Native macOS Notification Center (grouped by session, rich subtitle)
+            notif_group="peon-ping-${PEON_SESSION_ID:-default}"
+            if command -v terminal-notifier &>/dev/null; then
+              tn_args=(-title "$title" -message "$msg")
+              [ -n "$notif_subtitle" ] && tn_args+=(-subtitle "$notif_subtitle")
+              [ -f "$icon_path" ] && tn_args+=(-appIcon "$icon_path")
+              [ -n "$bundle_id" ] && tn_args+=(-activate "$bundle_id")
+
+              if [ -n "$click_command" ]; then
+                printf -v cmux_focus_cmd '/bin/bash -lc %q' "$click_command"
+                tn_args+=(-execute "$cmux_focus_cmd")
+              fi
+              _notify_debug "standard terminal-notifier group=$(printf '%q' "$notif_group") activate=$(printf '%q' "$bundle_id") execute=$(printf '%q' "${cmux_focus_cmd:-}")"
+
+              tn_args+=(-group "$notif_group")
+              # -group makes consecutive notifications from the same session replace each other in Notification Center
+              if [ "$use_bg" = true ]; then
+                nohup terminal-notifier "${tn_args[@]}" >/dev/null 2>&1 &
+              else
+                terminal-notifier "${tn_args[@]}" >/dev/null 2>&1
+              fi
             else
-              osascript - "$msg" "$title" "$notif_subtitle" >/dev/null 2>&1 <<'APPLESCRIPT'
+              # Fallback: osascript `display notification` — supports subtitle since 10.9
+              if [ "$use_bg" = true ]; then
+                nohup osascript - "$msg" "$title" "$notif_subtitle" >/dev/null 2>&1 <<'APPLESCRIPT' &
 on run argv
   set msg to item 1 of argv
   set tit to item 2 of argv
@@ -376,6 +554,20 @@ on run argv
   end if
 end run
 APPLESCRIPT
+              else
+                osascript - "$msg" "$title" "$notif_subtitle" >/dev/null 2>&1 <<'APPLESCRIPT'
+on run argv
+  set msg to item 1 of argv
+  set tit to item 2 of argv
+  set sub to item 3 of argv
+  if sub is "" then
+    display notification msg with title tit
+  else
+    display notification msg with title tit subtitle sub
+  end if
+end run
+APPLESCRIPT
+              fi
             fi
           fi
           ;;
